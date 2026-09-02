@@ -9,7 +9,7 @@ accounted for.
 ## Method
 
 1. Remove invalid rows and pairs present in fewer than
-   `max(10, ceil(0.05 * training samples))` samples.
+   `max(5, ceil(0.05 * training samples))` samples.
 2. Normalize each sample to unit retained mass and apply a square-root
    transformation for similarity calculations.
 3. Use an exact sparse prefix search to assign bacteria and genes to
@@ -19,8 +19,9 @@ accounted for.
    training split.
 5. Fit a ridge-logistic marginal model and calculate out-of-fold outcome
    residuals within the training data.
-6. Screen pair features against the outcome residual, residualize shortlisted
-   pairs against selected marginals, and test the pair residuals.
+6. Score every pair against the outcome residual after removing its learned
+   co-cluster block aggregate, retain two candidates per block, and use sparse
+   logistic selection on these residual pair features.
 7. Compare held-out prediction before and after adding residual pairs.
 
 ## Experiments
@@ -29,20 +30,48 @@ accounted for.
 | --- | --- | --- |
 | Prevalence | raw versus retained pairs and mass | initial information loss |
 | Marginals | intercept, bacteria, genes, both | signal at each dimension |
-| Clustering | unclustered versus clustered marginals | redundancy reduction without signal loss |
-| Pairs | marginals versus marginals plus residual pairs | joint information beyond marginals |
+| Clustering | planted versus recovered clusters in synthetic data | recovery and aggregation fidelity |
+| Pairs | pairs alone, marginals, and marginals plus residual pairs | pair signal and its added value beyond marginals |
 | Holdout | fixed stratified 80/20 split | fast exploratory prediction estimate |
 | Stability | final repeated folds, if justified | reproducibility of selected entities |
-| Synthetic | bacteria-only, gene-only, pair-only | attribution to the correct level |
+| Synthetic blocks | exact versus dropout/member noise | cluster recovery and aggregation loss |
+| Synthetic target | null, marginal, pair-only, marginal plus pairs | attribution and false discoveries by level |
+| Synthetic scale | 150/250/350 samples over three seeds | recovery, stability, runtime, and peak memory |
+
+## Synthetic design
+
+The main sparse generator uses 50 bacteria, 10,000 genes, 10 balanced bacteria
+clusters, and 100 balanced gene clusters. Each bacteria-cluster × gene-cluster
+block has 1%, 5%, 10%, 20%, or 40% prevalence. Shared block detection induces
+cluster structure; 5% member dropout and log-normal member noise make members
+similar rather than identical and leave approximately 90% zeros overall.
+
+The tensor is generated before the target. Marginal and full targets are
+Bernoulli draws from exact logistic models of standardized square-root relative
+abundance. They use three bacteria clusters, four gene clusters, and four
+mixed-direction pair residuals with distinct entities outside the marginal
+signal clusters. Each pair predictor is its square-root relative abundance
+after removing the true co-cluster block aggregate. This makes it information
+not shared by hundreds of block neighbors. There is no class-dependent
+modification of the tensor and no target-performance generation gate.
+
+Evaluation reports raw and prevalence-filtered cluster ARI/NMI, cluster counts,
+singletons, exact-comparison diagnostics, PPJoin recall on tractable subsets,
+holdout prediction, level-specific precision/recall/F1, null false discoveries,
+signal retention after prevalence filtering, oracle target performance,
+prevalence quantiles, runtime, and peak RSS. Bacteria and gene selection are
+scored on underlying members of planted clusters. The pair-only scenario
+separates pair recovery from failures in marginal nuisance estimation.
 
 ## Progression gates
 
 - Marginal signal: at least `0.030` holdout AUROC improvement over no-feature
   prediction; confirmation across folds is deferred until the method is stable.
-- Clustering: no more than `0.020` AUROC below unclustered marginals while
-  reducing modeled features by at least 20%.
-- Pair signal: at least `0.020` AUROC or 10% relative average-precision
-  improvement beyond the marginal model.
+- Clustering: synthetic assignments recover the planted high-similarity blocks
+  and every member satisfies both thresholds against its representative.
+- Pair signal: recall above `0.50`, useful precision, and at least `0.020`
+  AUROC or 10% relative average-precision improvement beyond the marginal model
+  in at least one reviewed strong-signal setup.
 - Stop before approximate graph search or factorization if both WirbelJ_2018
   and QinJ_2012 fail these simple gates.
 
@@ -53,5 +82,10 @@ accounted for.
   separate so that weak chains cannot form.
 - Residual tests are exploratory and rely on simple linear/logistic nuisance
   models.
+- The supervised two-per-block shortlist and fixed sparse-logistic penalty do
+  not provide post-selection p-values. Held-out prediction is valid for the
+  fixed split; entity-level error rates remain exploratory.
+- The current pair coefficient is deliberately strong (`±5`) to establish an
+  identifiable recovery regime before testing weaker effects.
 - Cluster components describe predictive redundancy, not biological pathways
   or causal groups.

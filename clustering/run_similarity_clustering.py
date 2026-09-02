@@ -14,7 +14,7 @@ DATASET = "WirbelJ_2018"
 INPUT = PROJECT / "outputs/preprocessing" / DATASET
 OUTPUT = PROJECT / "outputs/clustering" / DATASET
 PREVALENCE_FRACTION = 0.05
-MINIMUM_SAMPLES = 10
+MINIMUM_SAMPLES = 5
 METRIC = "correlation"  # Change to "bray_curtis" for the one sensitivity run.
 SIMILARITY_THRESHOLD = 0.95 if METRIC == "correlation" else 0.90
 JACCARD_THRESHOLD = 0.80

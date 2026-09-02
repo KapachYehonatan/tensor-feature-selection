@@ -1,9 +1,15 @@
+import copy
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 from scipy import sparse
+from scipy.special import expit
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -13,42 +19,94 @@ from research_utils import (  # noqa: E402
     _column_similarity,
     benjamini_hochberg,
     contextual_profiles,
+    exhaustive_similarity_clusters,
+    grouped_residual_features,
     normalize_rows,
+    prediction_matrix,
     prevalence_mask,
     similarity_clusters,
 )
-from run_datasets import cpu_allocation, datasets_to_run
-
-
-def brute_representative_labels(profiles, similarity_threshold, jaccard_threshold, metric):
-    """Small exhaustive reference for the representative clustering rule."""
-    csc = sparse.csc_matrix(profiles, dtype=float)
-    csc.eliminate_zeros()
-    csc.sort_indices()
-    support = np.diff(csc.indptr)
-    labels = np.full(csc.shape[1], -1, dtype=np.int64)
-    representatives = []
-    feature_order = np.lexsort((np.arange(csc.shape[1]), support))
-    for feature in feature_order:
-        best_representative = None
-        best_key = None
-        for representative in representatives:
-            similarity, jaccard = _column_similarity(csc, feature, representative, metric)
-            if similarity < similarity_threshold or jaccard < jaccard_threshold:
-                continue
-            key = (similarity, jaccard, -representative)
-            if best_key is None or key > best_key:
-                best_key = key
-                best_representative = representative
-        if best_representative is None:
-            labels[feature] = len(representatives)
-            representatives.append(feature)
-        else:
-            labels[feature] = labels[best_representative]
-    return labels
+from run_datasets import MAX_PARALLEL_DATASETS, N_CPUS, cpu_allocation, datasets_to_run
+from feature_selection.run_feature_selection import run_holdout_selection
+from scripts.generate_synthetic import (  # noqa: E402
+    generate_size,
+    load_configuration,
+    make_block_prevalence,
+    random_streams,
+    synthetic_worker_count,
+    tensor_to_csr,
+)
 
 
 class ResearchStepTests(unittest.TestCase):
+    def test_synthetic_worker_count_is_configurable_and_capped(self):
+        with patch.dict(os.environ, {"SYNTHETIC_WORKERS": "10"}):
+            self.assertEqual(synthetic_worker_count(6), 6)
+        with patch.dict(os.environ, {"SYNTHETIC_WORKERS": "0"}):
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                synthetic_worker_count(6)
+
+    def test_pair_only_model_is_conditional(self):
+        matrix = sparse.csr_matrix(np.ones((20, 1)))
+        y = np.tile([0, 1], 10)
+
+        def representations(x_train, x_test, *_args, **_kwargs):
+            train = sparse.csr_matrix(np.ones((x_train.shape[0], 1)))
+            test = sparse.csr_matrix(np.ones((x_test.shape[0], 1)))
+            return {
+                "bacteria_clusters": (train, test),
+                "gene_clusters": (train, test),
+                "marginal_clusters": (
+                    sparse.hstack([train, train], format="csr"),
+                    sparse.hstack([test, test], format="csr"),
+                ),
+            }, {
+                "threshold": 1,
+                "pair_mask": np.array([True]),
+                "pair_train": train,
+                "pair_test": test,
+                "pair_blocks": np.array([0]),
+                "active_bacteria": np.array([0]),
+                "active_genes": np.array([0]),
+                "bacteria_labels": np.array([0]),
+                "gene_labels": np.array([0]),
+                "selected_bacteria_clusters": np.array([0]),
+                "selected_gene_clusters": np.array([0]),
+            }
+
+        def prediction(_train_x, _train_y, test_x, _seed):
+            return np.full(test_x.shape[0], 0.5)
+
+        for selected_count in (0, 1):
+            selected = np.arange(selected_count)
+
+            def pairs(pair_train, pair_test, *_args, **_kwargs):
+                return pair_train[:, :selected_count], pair_test[:, :selected_count], selected
+
+            with patch(
+                "feature_selection.run_feature_selection.holdout_representations",
+                side_effect=representations,
+            ), patch(
+                "feature_selection.run_feature_selection.residual_pair_features",
+                side_effect=pairs,
+            ), patch(
+                "feature_selection.run_feature_selection.predict_model",
+                side_effect=prediction,
+            ):
+                result = run_holdout_selection(
+                    matrix, y, np.array([0]), np.array([0])
+                )
+
+            modes = set(result["metrics"]["mode"])
+            self.assertNotIn("unclustered_marginals", modes)
+            self.assertEqual("pairs_only" in modes, bool(selected_count))
+            if selected_count:
+                row = result["fold_model_info"].set_index("mode").loc["pairs_only"]
+                self.assertEqual(
+                    tuple(row[["bacteria_features", "gene_features", "pair_features"]]),
+                    (0, 0, 1),
+                )
+
     def test_normalization_rejects_empty_samples(self):
         with self.assertRaisesRegex(ValueError, "1 samples"):
             normalize_rows(sparse.csr_matrix([[0, 0], [2, 2]]))
@@ -64,10 +122,11 @@ class ResearchStepTests(unittest.TestCase):
         )
 
     def test_dataset_runner_cpu_allocation(self):
-        workers, threads, cpus = cpu_allocation(6, range(20))
-        self.assertEqual(workers, 3)
-        self.assertEqual(threads, 4)
-        self.assertEqual(cpus, list(range(12)))
+        workers, threads, cpus = cpu_allocation(6, range(N_CPUS + 4))
+        expected_workers = min(MAX_PARALLEL_DATASETS, N_CPUS, 6)
+        self.assertEqual(workers, expected_workers)
+        self.assertEqual(threads, N_CPUS // expected_workers)
+        self.assertEqual(cpus, list(range(N_CPUS)))
 
     def test_prevalence_counts_samples(self):
         matrix = sparse.csr_matrix(
@@ -109,13 +168,21 @@ class ResearchStepTests(unittest.TestCase):
                 for feature in range(profiles.shape[1]):
                     if not profiles[:, feature].any():
                         profiles[feature % len(profiles), feature] = 1
-                expected = brute_representative_labels(
+                expected, qualifying = exhaustive_similarity_clusters(
                     profiles, similarity_threshold, 0.70, metric
                 )
-                observed = similarity_clusters(
-                    profiles, similarity_threshold, 0.70, metric
+                observed, diagnostics = similarity_clusters(
+                    profiles,
+                    similarity_threshold,
+                    0.70,
+                    metric,
+                    return_diagnostics=True,
+                    collect_checked_pairs=True,
                 )
                 np.testing.assert_array_equal(observed, expected)
+                self.assertTrue(
+                    set(qualifying).issubset(set(diagnostics["checked_pairs"]))
+                )
                 csc = sparse.csc_matrix(profiles)
                 support = np.diff(csc.indptr)
                 for label in np.unique(observed):
@@ -182,12 +249,127 @@ class ResearchStepTests(unittest.TestCase):
         np.testing.assert_allclose(before.sum(axis=0), after.sum(axis=0))
         np.testing.assert_allclose(before.sum(axis=1), after.sum(axis=1))
 
+    def test_single_target_predictions_remain_a_column(self):
+        prediction = prediction_matrix(np.array([0.2, 0.8]), 2)
+        np.testing.assert_array_equal(prediction, [[0.2], [0.8]])
+        self.assertEqual(prediction_matrix(np.ones((2, 3)), 2).shape, (2, 3))
+
+    def test_synthetic_configuration_has_smoke_and_main_scales(self):
+        configuration, name, smoke = load_configuration(preset_name="smoke")
+        self.assertEqual(name, "smoke")
+        self.assertEqual(smoke["sample_sizes"], [40])
+        main = configuration["presets"]["main"]
+        self.assertEqual(main["sample_sizes"], [150, 250, 350])
+        self.assertEqual(
+            (main["bacteria"], main["genes"], main["bacteria_clusters"], main["gene_clusters"]),
+            (50, 10_000, 10, 100),
+        )
+        self.assertEqual(main["pair_count"], 4)
+        self.assertEqual(main["pair_effect"], 5.0)
+        self.assertNotIn("pair_detection_low", main)
+        _, rng = random_streams(101, 40)
+        prevalence = make_block_prevalence(smoke, rng["prevalence"])
+        self.assertEqual(prevalence.min(), 0.01)
+        self.assertEqual(prevalence.max(), 0.40)
+        self.assertAlmostEqual(prevalence.mean(), 0.097)
+
+    def test_synthetic_generation_is_reproducible_and_sparse(self):
+        configuration, _, preset = load_configuration(preset_name="smoke")
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            roots = []
+            for directory in (first, second):
+                local = copy.deepcopy(configuration)
+                local["paths"]["data_root"] = directory
+                generate_size(local, "smoke", preset, 40, 101)
+                roots.append(Path(directory) / "smoke" / "n_40" / "seed_101")
+
+            for scenario in configuration["scenarios"]:
+                first_tensor = np.load(roots[0] / scenario / "tensor.npz")
+                second_tensor = np.load(roots[1] / scenario / "tensor.npz")
+                for key in first_tensor.files:
+                    np.testing.assert_array_equal(first_tensor[key], second_tensor[key])
+
+            noisy = roots[0] / "noisy_blocks"
+            matrix, edge_bacteria, edge_gene, shape = tensor_to_csr(noisy)
+            self.assertEqual(shape, (40, 10, 200))
+            self.assertEqual(len(edge_bacteria), 2000)
+            self.assertEqual(len(edge_gene), 2000)
+            sparsity = 1 - matrix.nnz / np.prod(shape)
+            self.assertGreaterEqual(sparsity, 0.88)
+            self.assertLessEqual(sparsity, 0.93)
+            pd.testing.assert_frame_equal(
+                pd.read_csv(roots[0] / "exact_blocks" / "block_truth.csv.gz"),
+                pd.read_csv(noisy / "block_truth.csv.gz"),
+            )
+
+            noisy_inode = (noisy / "tensor.npz").stat().st_ino
+            for scenario in (
+                "null_target", "marginal_signals", "pair_signals", "full_signals"
+            ):
+                self.assertEqual(
+                    (roots[0] / scenario / "tensor.npz").stat().st_ino,
+                    noisy_inode,
+                )
+                with np.load(roots[0] / scenario / "target_model.npz") as model:
+                    np.testing.assert_allclose(
+                        model["probability"], expit(model["linear_predictor"])
+                    )
+                    self.assertAlmostEqual(float(model["probability"].mean()), 0.5)
+            with np.load(roots[0] / "null_target" / "target_model.npz") as model:
+                np.testing.assert_allclose(model["probability"], 0.5)
+
+    def test_pair_truth_uses_distinct_nonmarginal_entities(self):
+        configuration, _, preset = load_configuration(preset_name="smoke")
+        with tempfile.TemporaryDirectory() as directory:
+            local = copy.deepcopy(configuration)
+            local["paths"]["data_root"] = directory
+            generate_size(local, "smoke", preset, 40, 101)
+            root = Path(directory) / "smoke" / "n_40" / "seed_101"
+            signals = pd.read_csv(root / "full_signals" / "signal_truth.csv.gz")
+            pairs = signals[signals["level"].eq("pair")]
+            bacteria = pd.read_csv(root / "full_signals" / "bacteria_truth.csv.gz")
+            genes = pd.read_csv(root / "full_signals" / "gene_truth.csv.gz")
+            self.assertEqual(len(pairs), preset["pair_count"])
+            self.assertEqual(pairs["bacterium"].nunique(), preset["pair_count"])
+            self.assertEqual(pairs["gene"].nunique(), preset["pair_count"])
+            self.assertFalse(
+                bacteria.loc[pairs["bacterium"].astype(int), "true_cluster"].isin([0]).any()
+            )
+            self.assertFalse(
+                genes.loc[pairs["gene"].astype(int), "true_cluster"].isin([1, 7]).any()
+            )
+            self.assertGreaterEqual(pairs["expected_prevalence"].min(), 0.38)
+            self.assertGreaterEqual(pairs["realized_support"].min(), 5)
+            self.assertEqual(set(pairs["direction"]), {"positive", "negative"})
+
     def test_bh_is_monotone_in_rank(self):
         p = np.array([0.03, 0.001, 0.02, 0.8])
         q = benjamini_hochberg(p)
         order = np.argsort(p)
         self.assertTrue(np.all(np.diff(q[order]) >= 0))
         self.assertTrue(np.all((0 <= q) & (q <= 1)))
+
+    def test_grouped_pair_residuals_remove_block_aggregate(self):
+        matrix = sparse.csr_matrix([
+            [1.0, 2.0, 0.0, 1.0],
+            [2.0, 2.0, 1.0, 0.0],
+            [0.0, 1.0, 2.0, 3.0],
+            [3.0, 0.0, 1.0, 2.0],
+        ])
+        groups = np.array([0, 0, 1, 1])
+        residual, _ = grouped_residual_features(
+            matrix, matrix, groups, np.arange(matrix.shape[1])
+        )
+        totals = np.column_stack([
+            np.asarray(matrix[:, groups == group].sum(axis=1)).ravel()
+            for group in np.unique(groups)
+        ])
+        centered_totals = totals - totals.mean(axis=0)
+        for column, group in enumerate(groups):
+            self.assertAlmostEqual(
+                float(residual[:, column].toarray().ravel() @ centered_totals[:, group]),
+                0.0,
+            )
 
 
 if __name__ == "__main__":

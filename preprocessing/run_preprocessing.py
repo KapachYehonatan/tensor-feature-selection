@@ -18,7 +18,7 @@ TARGET_COLUMN = "disease"
 NEGATIVE_LABEL = "healthy"
 POSITIVE_LABEL = os.environ.get("POSITIVE_LABEL", "CRC")
 PREVALENCE_FRACTION = 0.05
-MINIMUM_SAMPLES = 10
+MINIMUM_SAMPLES = 5
 OUTPUT = PROJECT / "outputs/preprocessing" / DATASET
 
 sys.path.insert(0, str(PROJECT))

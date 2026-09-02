@@ -37,16 +37,67 @@ Run the unit tests:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Generate the small synthetic datasets:
+Generate and evaluate the small synthetic smoke preset:
 
 ```bash
-.venv/bin/python synthetic/run_synthetic.py
+.venv/bin/python scripts/generate_synthetic.py
+.venv/bin/python scripts/evaluate_synthetic.py
 ```
+
+These commands use the `active_preset` in `synthetic_config.json`, currently
+`smoke`.
+
+## Main synthetic experiment
+
+The main preset is not run automatically. Generate it in the background with:
+
+```bash
+nohup env PYTHONUNBUFFERED=1 SYNTHETIC_PRESET=main \
+  SYNTHETIC_WORKERS=10 \
+  OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  NUMEXPR_NUM_THREADS=2 BLIS_NUM_THREADS=2 \
+  .venv/bin/python scripts/generate_synthetic.py \
+  > logs/synthetic_generate.log 2>&1 &
+long_run_pid=$!
+echo "$long_run_pid" | tee logs/synthetic_generate.pid
+```
+
+Only after generation finishes, run evaluation similarly:
+
+```bash
+nohup env PYTHONUNBUFFERED=1 SYNTHETIC_PRESET=main \
+  SYNTHETIC_WORKERS=10 \
+  OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  NUMEXPR_NUM_THREADS=2 BLIS_NUM_THREADS=2 \
+  .venv/bin/python scripts/evaluate_synthetic.py \
+  > logs/synthetic_evaluate.log 2>&1 &
+long_run_pid=$!
+echo "$long_run_pid" | tee logs/synthetic_evaluate.pid
+```
+
+After evaluation finishes, export the repeated-run figures in the foreground:
+
+```bash
+.venv/bin/python scripts/plot_synthetic_results.py
+```
+
+The plotting script averages independent seeds within each sample size and
+scenario, shows their standard deviation and individual observations, and
+writes PNG/PDF figures plus averaged CSV scores under
+`outputs/synthetic_evaluation/main/figures/`.
+
+Generation runs independent `(sample size, seed)` configurations concurrently;
+evaluation runs independent `(sample size, seed, scenario)` datasets
+concurrently. Both default to five workers and each job runs in a fresh child
+process, so its peak RSS is meaningful. Set `SYNTHETIC_WORKERS=10` to run ten at
+once, or `=1` for sequential execution. Total CPU and memory are approximately
+the per-worker requirements multiplied by `SYNTHETIC_WORKERS`; keep the
+numerical-library thread variables small enough to avoid CPU oversubscription.
 
 ## CPU control
 
-These variables limit the native numerical libraries to four threads.
-`taskset` restricts the process to four CPU cores:
+These variables limit native numerical-library threads. `taskset` restricts
+the process to the chosen CPU cores:
 
 ```bash
 env \
@@ -97,7 +148,7 @@ Useful byte limits are:
 NumPy and SciPy may reserve more virtual memory than they actively use, so
 leave headroom. If the limit is reached, allocation can fail with
 `MemoryError`. Memory limiting is optional and is not used in the recommended
-commands below.
+commands above.
 
 Measure a foreground run, including peak resident memory, with:
 
@@ -113,11 +164,7 @@ Measure a foreground run, including peak resident memory, with:
   .venv/bin/python preprocessing/run_preprocessing.py
 ```
 
-## Background run with `nohup`
-
-This is the recommended real preprocessing command. It allows up to 16 native
-numerical-library threads and uses unbuffered output so the log updates
-promptly:
+## Background preprocessing with `nohup`
 
 ```bash
 nohup env \
@@ -167,7 +214,7 @@ top of each script. Feature selection uses a fixed 80/20 holdout and two
 co-clustering rounds by default; reduce `MAX_CLUSTER_ROUNDS` to `1` only for a
 short exploratory smoke run. Keep `INNER_FOLDS=3` for leakage-safe residuals.
 
-## Parallel datasets
+## Parallel real datasets
 
 Set `DATASETS` near the top of `run_datasets.py` to `"all"`, one name, or a
 list. The same file has two direct resource controls:

@@ -1,0 +1,77 @@
+{
+  "format_version": 2,
+  "active_preset": "main",
+  "paths": {
+    "data_root": "outputs/synthetic",
+    "evaluation_root": "outputs/synthetic_evaluation"
+  },
+  "scenarios": [
+    "exact_blocks",
+    "noisy_blocks",
+    "null_target",
+    "marginal_signals",
+    "pair_signals",
+    "full_signals"
+  ],
+  "evaluation": {
+    "prevalence_fraction": 0.05,
+    "minimum_samples": 5,
+    "metric": "correlation",
+    "similarity_threshold": 0.93,
+    "jaccard_threshold": 0.8,
+    "max_cluster_rounds": 2,
+    "screen_fdr": 0.1,
+    "pair_candidates_per_block": 2,
+    "pair_l1_c": 0.033,
+    "max_selected_per_level": 200,
+    "test_fraction": 0.2,
+    "inner_folds": 3,
+    "holdout_seed": 42,
+    "model_seed": 42,
+    "ppjoin_subset_features": 500
+  },
+  "presets": {
+    "smoke": {
+      "sample_sizes": [40],
+      "bacteria": 10,
+      "genes": 200,
+      "bacteria_clusters": 5,
+      "gene_clusters": 20,
+      "seeds": [101],
+      "mu": -3.0,
+      "block_prevalence_levels": [0.01, 0.05, 0.10, 0.20, 0.40],
+      "block_prevalence_weights": [0.20, 0.40, 0.15, 0.20, 0.05],
+      "member_dropout": 0.05,
+      "sigma_bacteria": 0.6,
+      "sigma_gene": 0.6,
+      "sigma_member": 0.2,
+      "bacteria_effects": {"0": 0.8},
+      "gene_effects": {"1": 0.7, "7": -0.7},
+      "target_prevalence": 0.5,
+      "pair_count": 2,
+      "pair_effect": 1.0,
+      "signal_pair_min_block_prevalence": 0.40
+    },
+    "main": {
+      "sample_sizes": [150, 250, 350, 500],
+      "bacteria": 50,
+      "genes": 10000,
+      "bacteria_clusters": 10,
+      "gene_clusters": 100,
+      "seeds": [101, 202, 303, 404, 505, 606, 707],
+      "mu": -3.0,
+      "block_prevalence_levels": [0.01, 0.05, 0.10, 0.20, 0.40],
+      "block_prevalence_weights": [0.20, 0.40, 0.15, 0.20, 0.05],
+      "member_dropout": 0.05,
+      "sigma_bacteria": 0.6,
+      "sigma_gene": 0.6,
+      "sigma_member": 0.2,
+      "bacteria_effects": {"1": 0.6, "4": -0.6, "8": 0.8},
+      "gene_effects": {"5": 0.5, "28": -0.5, "62": 0.7, "91": -0.7},
+      "target_prevalence": 0.5,
+      "pair_count": 4,
+      "pair_effect": 5.0,
+      "signal_pair_min_block_prevalence": 0.20
+    }
+  }
+}

@@ -51,7 +51,7 @@ def sample_support(matrix):
     return np.asarray(detected.getnnz(axis=0)).ravel().astype(np.int32)
 
 
-def prevalence_mask(matrix, fraction=0.05, minimum_samples=10):
+def prevalence_mask(matrix, fraction=0.05, minimum_samples=5):
     if not 0 < fraction <= 1:
         raise ValueError("Prevalence fraction must be in (0, 1]")
     threshold = max(minimum_samples, int(np.ceil(fraction * matrix.shape[0])))
@@ -74,6 +74,11 @@ def sqrt_sparse(matrix):
     transformed = sparse.csr_matrix(matrix, dtype=np.float64).copy()
     transformed.data = np.sqrt(transformed.data)
     return transformed
+
+
+def prediction_matrix(values, n_rows):
+    """Keep a single predicted target as an n-by-1 matrix."""
+    return np.asarray(values).reshape(n_rows, -1)
 
 
 def marginal_matrix(matrix, pair_entity, n_entities):
@@ -174,6 +179,7 @@ def similarity_clusters(
     jaccard_threshold=0.80,
     metric="correlation",
     return_diagnostics=False,
+    collect_checked_pairs=False,
     verbose=False,
 ):
     """Assign columns to directly similar representatives, without choosing K."""
@@ -211,6 +217,7 @@ def similarity_clusters(
         "accepted_assignments": 0,
         "representatives": 0,
     }
+    checked_pairs = [] if collect_checked_pairs else None
     if not n_features:
         diagnostics["elapsed_seconds"] = perf_counter() - started
         result = np.empty(0, dtype=np.int64)
@@ -287,6 +294,8 @@ def similarity_clusters(
             if prefix_overlap < 0:
                 continue
             exact_jaccard_checks += 1
+            if checked_pairs is not None:
+                checked_pairs.append((int(feature), int(representative)))
             common = _support_overlap(csc, feature, representative)
             union = size + support[representative] - common
             jaccard = common / union
@@ -343,6 +352,8 @@ def similarity_clusters(
         "representatives": next_label,
         "elapsed_seconds": perf_counter() - started,
     })
+    if checked_pairs is not None:
+        diagnostics["checked_pairs"] = checked_pairs
     if verbose:
         print(
             f"Similarity clustering complete: {n_features:,} features -> "
@@ -355,6 +366,48 @@ def similarity_clusters(
     return (labels, diagnostics) if return_diagnostics else labels
 
 
+def exhaustive_similarity_clusters(
+    profiles,
+    similarity_threshold=0.95,
+    jaccard_threshold=0.80,
+    metric="correlation",
+):
+    """Small exhaustive reference for the representative clustering rule."""
+    csc = sparse.csc_matrix(profiles, dtype=np.float64)
+    csc.sum_duplicates()
+    csc.eliminate_zeros()
+    csc.sort_indices()
+    support = np.diff(csc.indptr)
+    if np.any(support == 0):
+        raise ValueError("Exhaustive comparison received a zero-support feature")
+
+    labels = np.full(csc.shape[1], -1, dtype=np.int64)
+    representatives = []
+    qualifying_pairs = []
+    feature_order = np.lexsort((np.arange(csc.shape[1]), support))
+    for feature in feature_order:
+        best_representative = None
+        best_key = None
+        for representative in representatives:
+            similarity, jaccard = _column_similarity(
+                csc, feature, representative, metric
+            )
+            if jaccard >= jaccard_threshold:
+                qualifying_pairs.append((int(feature), int(representative)))
+            if jaccard < jaccard_threshold or similarity < similarity_threshold:
+                continue
+            key = (similarity, jaccard, -representative)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_representative = representative
+        if best_representative is None:
+            labels[feature] = len(representatives)
+            representatives.append(int(feature))
+        else:
+            labels[feature] = labels[best_representative]
+    return labels, qualifying_pairs
+
+
 def similarity_coclustering(
     matrix,
     pair_bacteria,
@@ -365,6 +418,8 @@ def similarity_coclustering(
     jaccard_threshold=0.80,
     metric="correlation",
     rounds=3,
+    return_diagnostics=False,
+    collect_checked_pairs=False,
     verbose=False,
 ):
     """Alternate conservative similarity clustering across the two modes."""
@@ -376,10 +431,18 @@ def similarity_coclustering(
     bacteria_marginal = marginal_matrix(matrix, local_bacteria, len(active_bacteria))
     if verbose:
         print("Clustering bacteria marginals", flush=True)
-    bacteria_labels = similarity_clusters(
+    diagnostics = []
+    bacteria_result = similarity_clusters(
         sqrt_sparse(bacteria_marginal), similarity_threshold,
-        jaccard_threshold, metric, verbose=verbose,
+        jaccard_threshold, metric, return_diagnostics=return_diagnostics,
+        collect_checked_pairs=collect_checked_pairs, verbose=verbose,
     )
+    if return_diagnostics:
+        bacteria_labels, stage = bacteria_result
+        stage["stage"] = "initial_bacteria"
+        diagnostics.append(stage)
+    else:
+        bacteria_labels = bacteria_result
     gene_labels = np.arange(len(active_genes), dtype=np.int64)
 
     for round_index in range(rounds):
@@ -392,10 +455,17 @@ def similarity_coclustering(
             len(active_genes),
             int(bacteria_labels.max()) + 1,
         )
-        new_gene_labels = similarity_clusters(
+        gene_result = similarity_clusters(
             sqrt_sparse(gene_profiles), similarity_threshold,
-            jaccard_threshold, metric, verbose=verbose,
+            jaccard_threshold, metric, return_diagnostics=return_diagnostics,
+            collect_checked_pairs=collect_checked_pairs, verbose=verbose,
         )
+        if return_diagnostics:
+            new_gene_labels, stage = gene_result
+            stage["stage"] = f"round_{round_index + 1}_genes"
+            diagnostics.append(stage)
+        else:
+            new_gene_labels = gene_result
         if verbose:
             print(f"Co-clustering round {round_index + 1}: bacteria", flush=True)
         bacteria_profiles = contextual_profiles(
@@ -405,10 +475,17 @@ def similarity_coclustering(
             len(active_bacteria),
             int(new_gene_labels.max()) + 1,
         )
-        new_bacteria_labels = similarity_clusters(
+        bacteria_result = similarity_clusters(
             sqrt_sparse(bacteria_profiles), similarity_threshold,
-            jaccard_threshold, metric, verbose=verbose,
+            jaccard_threshold, metric, return_diagnostics=return_diagnostics,
+            collect_checked_pairs=collect_checked_pairs, verbose=verbose,
         )
+        if return_diagnostics:
+            new_bacteria_labels, stage = bacteria_result
+            stage["stage"] = f"round_{round_index + 1}_bacteria"
+            diagnostics.append(stage)
+        else:
+            new_bacteria_labels = bacteria_result
         stable = (
             np.array_equal(new_gene_labels, gene_labels)
             and np.array_equal(new_bacteria_labels, bacteria_labels)
@@ -417,7 +494,8 @@ def similarity_coclustering(
         if stable:
             break
 
-    return active_bacteria, bacteria_labels, active_genes, gene_labels
+    result = active_bacteria, bacteria_labels, active_genes, gene_labels
+    return (*result, diagnostics) if return_diagnostics else result
 
 
 def mann_whitney_scores(matrix, y, chunk_size=2000):
@@ -465,3 +543,114 @@ def residual_correlation_scores(matrix, residual):
     statistic = correlation * np.sqrt((n - 2) / (1 - correlation * correlation))
     p_values = 2 * stats.t.sf(np.abs(statistic), df=max(n - 2, 1))
     return correlation, p_values, benjamini_hochberg(p_values)
+
+
+def grouped_partial_correlation_scores(matrix, residual, groups):
+    """Score each sparse feature after removing its group's aggregate signal."""
+    matrix = sparse.csc_matrix(matrix, dtype=np.float64)
+    residual = np.asarray(residual, dtype=float)
+    groups = np.asarray(groups)
+    if matrix.shape[0] != len(residual) or matrix.shape[1] != len(groups):
+        raise ValueError("Matrix, residual, and group labels do not align")
+    _, groups = np.unique(groups, return_inverse=True)
+    totals = marginal_matrix(matrix, groups, int(groups.max()) + 1).tocsc()
+    n = matrix.shape[0]
+
+    sum_x = np.asarray(matrix.sum(axis=0)).ravel()
+    sum_x2 = np.asarray(matrix.power(2).sum(axis=0)).ravel()
+    sum_y, sum_y2 = residual.sum(), np.dot(residual, residual)
+    cross_xy = np.asarray(matrix.T @ residual).ravel()
+    sum_z = np.asarray(totals.sum(axis=0)).ravel()
+    sum_z2 = np.asarray(totals.power(2).sum(axis=0)).ravel()
+    cross_zy = np.asarray(totals.T @ residual).ravel()
+    covariance_zy = cross_zy - sum_z * sum_y / n
+    variance_z = sum_z2 - sum_z * sum_z / n
+
+    covariance_xz = np.empty(matrix.shape[1])
+    for group in range(totals.shape[1]):
+        members = np.flatnonzero(groups == group)
+        cross = (matrix[:, members].T @ totals[:, group]).toarray().ravel()
+        covariance_xz[members] = cross - sum_x[members] * sum_z[group] / n
+
+    variance_x = sum_x2 - sum_x * sum_x / n
+    variance_y = sum_y2 - sum_y * sum_y / n
+    covariance_xy = cross_xy - sum_x * sum_y / n
+    valid_group = variance_z[groups] > 0
+    partial_covariance = covariance_xy.copy()
+    partial_variance_x = variance_x.copy()
+    partial_variance_y = np.full(matrix.shape[1], variance_y)
+    partial_covariance[valid_group] -= (
+        covariance_xz[valid_group]
+        * covariance_zy[groups[valid_group]]
+        / variance_z[groups[valid_group]]
+    )
+    partial_variance_x[valid_group] -= (
+        covariance_xz[valid_group] ** 2 / variance_z[groups[valid_group]]
+    )
+    partial_variance_y[valid_group] -= (
+        covariance_zy[groups[valid_group]] ** 2 / variance_z[groups[valid_group]]
+    )
+    denominator = np.sqrt(
+        np.maximum(partial_variance_x, 0) * np.maximum(partial_variance_y, 0)
+    )
+    correlation = np.divide(
+        partial_covariance,
+        denominator,
+        out=np.zeros_like(partial_covariance),
+        where=denominator > 0,
+    ).clip(-0.999999, 0.999999)
+    statistic = correlation * np.sqrt((n - 3) / (1 - correlation * correlation))
+    p_values = 2 * stats.t.sf(np.abs(statistic), df=max(n - 3, 1))
+    return correlation, p_values, benjamini_hochberg(p_values)
+
+
+def grouped_residual_features(train, test, groups, columns):
+    """Residualize selected columns against their group totals using train data."""
+    train = sparse.csc_matrix(train, dtype=np.float64)
+    test = sparse.csc_matrix(test, dtype=np.float64)
+    groups = np.asarray(groups)
+    columns = np.asarray(columns, dtype=int)
+    if train.shape[1] != test.shape[1] or train.shape[1] != len(groups):
+        raise ValueError("Train, test, and group labels do not align")
+    if np.any((columns < 0) | (columns >= train.shape[1])):
+        raise ValueError("Residual feature column is out of range")
+    if not len(columns):
+        return (
+            sparse.csr_matrix((train.shape[0], 0)),
+            sparse.csr_matrix((test.shape[0], 0)),
+        )
+
+    _, groups = np.unique(groups, return_inverse=True)
+    n_groups = int(groups.max()) + 1
+    totals_train = marginal_matrix(train, groups, n_groups).tocsc()
+    totals_test = marginal_matrix(test, groups, n_groups).tocsc()
+    selected_groups = groups[columns]
+    sum_x = np.asarray(train[:, columns].sum(axis=0)).ravel()
+    sum_z = np.asarray(totals_train.sum(axis=0)).ravel()
+    sum_z2 = np.asarray(totals_train.power(2).sum(axis=0)).ravel()
+    variance_z = sum_z2 - sum_z * sum_z / train.shape[0]
+    coefficient = np.zeros(len(columns))
+
+    for group in np.unique(selected_groups):
+        positions = np.flatnonzero(selected_groups == group)
+        selected = columns[positions]
+        cross = (train[:, selected].T @ totals_train[:, group]).toarray().ravel()
+        covariance = cross - sum_x[positions] * sum_z[group] / train.shape[0]
+        if variance_z[group] > 0:
+            coefficient[positions] = covariance / variance_z[group]
+
+    intercept = (
+        sum_x / train.shape[0]
+        - coefficient * sum_z[selected_groups] / train.shape[0]
+    )
+    train_residual = (
+        train[:, columns].toarray()
+        - totals_train[:, selected_groups].toarray() * coefficient
+        - intercept
+    )
+    test_residual = (
+        test[:, columns].toarray()
+        - totals_test[:, selected_groups].toarray() * coefficient
+        - intercept
+    )
+    return sparse.csr_matrix(train_residual), sparse.csr_matrix(test_residual)
