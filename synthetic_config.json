@@ -23,7 +23,6 @@
     "screen_fdr": 0.1,
     "pair_candidates_per_block": 2,
     "pair_l1_c": 0.033,
-    "max_selected_per_level": 200,
     "test_fraction": 0.2,
     "inner_folds": 3,
     "holdout_seed": 42,

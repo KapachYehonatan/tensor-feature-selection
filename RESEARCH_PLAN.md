@@ -36,7 +36,8 @@ accounted for.
 | Stability | final repeated folds, if justified | reproducibility of selected entities |
 | Synthetic blocks | exact versus dropout/member noise | cluster recovery and aggregation loss |
 | Synthetic target | null, marginal, pair-only, marginal plus pairs | attribution and false discoveries by level |
-| Synthetic scale | 150/250/350 samples over three seeds | recovery, stability, runtime, and peak memory |
+| Synthetic scale | 150/250/350/500 samples over seven seeds | recovery, stability, runtime, and peak memory |
+| Top-K baselines | pairs, collapsed marginals, clustered marginals, and residual pairs | prediction versus feature budget |
 
 ## Synthetic design
 
@@ -89,3 +90,12 @@ separates pair recovery from failures in marginal nuisance estimation.
   identifiable recovery regime before testing weaker effects.
 - Cluster components describe predictive redundancy, not biological pathways
   or causal groups.
+
+## Top-K comparison
+
+Use the six cross-sectional real datasets and synthetic `full_signals`. Compare
+ten K values from 50 through 600 with one shared training-only 80/20 holdout.
+Report AUROC, precision, recall, F1, biological feature counts, and BH RSP where
+defined. Average synthetic seeds within sample size before giving sample sizes
+equal weight. The scientific pipeline has no fixed 200-feature cap; K limits
+only each comparison model, not the underlying selection output.

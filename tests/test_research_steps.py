@@ -27,7 +27,21 @@ from research_utils import (  # noqa: E402
     similarity_clusters,
 )
 from run_datasets import MAX_PARALLEL_DATASETS, N_CPUS, cpu_allocation, datasets_to_run
-from feature_selection.run_feature_selection import run_holdout_selection
+from feature_selection.run_feature_selection import (
+    residual_pair_features,
+    run_holdout_selection,
+    selected_columns,
+)
+from scripts.run_method_comparison import (
+    bh_family,
+    collapsed_average,
+    evaluate_ranked,
+    is_complete,
+    rsp_row,
+    synthetic_jobs,
+    write_completion,
+)
+from scripts.summarize_method_comparison import curve_summary, seed_average
 from scripts.generate_synthetic import (  # noqa: E402
     generate_size,
     load_configuration,
@@ -39,6 +53,111 @@ from scripts.generate_synthetic import (  # noqa: E402
 
 
 class ResearchStepTests(unittest.TestCase):
+    def test_marginal_and_pair_selection_have_no_200_feature_cap(self):
+        y = np.repeat([0, 1], 10)
+        values = np.tile(y[:, None], (1, 225))
+        selected, _ = selected_columns(sparse.csr_matrix(values), y)
+        self.assertEqual(len(selected), 225)
+
+        details = {
+            "candidates": np.arange(225),
+            "residual_train": sparse.csr_matrix(np.ones((20, 225))),
+            "residual_test": sparse.csr_matrix(np.ones((4, 225))),
+            "pair_coefficients": np.ones(225),
+        }
+        with patch(
+            "feature_selection.run_feature_selection.fit_sequential_selector",
+            return_value=details,
+        ):
+            train, test, pairs = residual_pair_features(
+                sparse.csr_matrix((20, 225)), sparse.csr_matrix((4, 225)),
+                np.arange(225), sparse.csr_matrix((20, 0)), y,
+            )
+        self.assertEqual((train.shape[1], test.shape[1], len(pairs)), (225, 225, 225))
+
+    def test_comparison_collapsed_average_and_feature_counts(self):
+        matrix = sparse.csr_matrix([[2.0, 4.0, 3.0], [0.0, 2.0, 6.0]])
+        collapsed, active = collapsed_average(matrix, np.array([0, 0, 1]), 3)
+        np.testing.assert_array_equal(active, [0, 1])
+        np.testing.assert_allclose(collapsed.toarray(), np.sqrt([[3.0, 3.0], [1.0, 6.0]]))
+
+        ranking = pd.DataFrame({"level": ["bacterium", "gene", "pair"]})
+        with patch(
+            "scripts.run_method_comparison.predict_model",
+            return_value=np.array([0.2, 0.8, 0.7, 0.3]),
+        ):
+            metrics, _ = evaluate_ranked(
+                "clustered_plus_pairs",
+                sparse.csr_matrix(np.ones((8, 3))),
+                sparse.csr_matrix(np.ones((4, 3))),
+                ranking,
+                np.tile([0, 1], 4), np.array([0, 1, 1, 0]),
+                {"bacteria": 1, "gene": 1, "pair": 1},
+            )
+        last = metrics.iloc[-1]
+        self.assertEqual(
+            tuple(last[["bacteria_features", "gene_features", "pair_features", "effective_k"]]),
+            (1, 1, 1, 3),
+        )
+
+    def test_comparison_bh_rsp_and_cache_are_deterministic(self):
+        matrix = sparse.csr_matrix([
+            [0, 0, 1], [0, 1, 0], [0, 0, 2], [1, 1, 0],
+            [4, 0, 1], [3, 1, 0], [5, 0, 2], [4, 1, 0],
+        ])
+        y = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+        first = bh_family(matrix, [y, y[::-1]])
+        second = bh_family(matrix, [y, y[::-1]])
+        np.testing.assert_array_equal(first["order"], second["order"])
+        np.testing.assert_allclose(first["q"], second["q"])
+        score = rsp_row("bh_pairs", [20, 1, 3, 2, 2, 2])
+        self.assertAlmostEqual(score["sp"], 2.0)
+        self.assertAlmostEqual(score["rsp"], -1 / 3)
+        self.assertEqual(rsp_row("bh_pairs", [0, 0, 0, 0, 0, 0])["rsp"], 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            write_completion(cache, "abc")
+            self.assertTrue(is_complete(cache, "abc"))
+            self.assertFalse(is_complete(cache, "different"))
+
+    def test_comparison_uses_only_full_signal_synthetic_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "data" / "main" / "n_12" / "seed_7" / "full_signals"
+            dataset.mkdir(parents=True)
+            np.save(dataset / "target.npy", np.array([0, 1]))
+            configuration = {"paths": {"data_root": "data"}}
+            preset = {"sample_sizes": [12], "seeds": [7]}
+            with patch("scripts.run_method_comparison.PROJECT", root), patch(
+                "scripts.run_method_comparison.load_configuration",
+                return_value=(configuration, "main", preset),
+            ):
+                jobs = synthetic_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["scenario"], "full_signals")
+
+    def test_comparison_seed_average_precedes_n_summary(self):
+        rows = []
+        for seed, score in [(1, 0.6), (2, 0.8)]:
+            for k in [50, 100]:
+                rows.append({
+                    "source": "synthetic", "dataset": "n_20", "n": 20,
+                    "seed": seed, "scenario": "full_signals", "method": "bh_pairs",
+                    "method_label": "BH", "requested_k": k, "effective_k": k,
+                    "auroc": score, "precision": score, "recall": score, "f1": score,
+                    "output_bacteria_features": 0, "output_gene_features": 0,
+                    "output_pair_features": 100, "output_total_features": 100,
+                    "selected_bacteria_features": 0, "selected_gene_features": 0,
+                    "selected_pair_features": 4, "selected_total_features": 4,
+                })
+        averaged = seed_average(pd.DataFrame(rows))
+        self.assertTrue(np.allclose(averaged["auroc"], 0.7))
+        summary = curve_summary(
+            averaged, ["source", "dataset", "n", "method", "method_label"]
+        )
+        self.assertAlmostEqual(summary.loc[0, "mean_auroc"], 0.7)
+
     def test_synthetic_worker_count_is_configurable_and_capped(self):
         with patch.dict(os.environ, {"SYNTHETIC_WORKERS": "10"}):
             self.assertEqual(synthetic_worker_count(6), 6)
@@ -259,7 +378,8 @@ class ResearchStepTests(unittest.TestCase):
         self.assertEqual(name, "smoke")
         self.assertEqual(smoke["sample_sizes"], [40])
         main = configuration["presets"]["main"]
-        self.assertEqual(main["sample_sizes"], [150, 250, 350])
+        self.assertEqual(main["sample_sizes"], [150, 250, 350, 500])
+        self.assertEqual(len(main["seeds"]), 7)
         self.assertEqual(
             (main["bacteria"], main["genes"], main["bacteria_clusters"], main["gene_clusters"]),
             (50, 10_000, 10, 100),

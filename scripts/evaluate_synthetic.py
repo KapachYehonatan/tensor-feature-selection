@@ -73,7 +73,6 @@ def selection_kwargs(settings):
         "screen_fdr": float(settings["screen_fdr"]),
         "pair_candidates_per_block": int(settings["pair_candidates_per_block"]),
         "pair_l1_c": float(settings["pair_l1_c"]),
-        "max_selected": int(settings["max_selected_per_level"]),
         "test_fraction": float(settings["test_fraction"]),
         "inner_folds_count": int(settings["inner_folds"]),
         "holdout_seed": int(settings["holdout_seed"]),

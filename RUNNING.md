@@ -249,3 +249,38 @@ tail -f logs/datasets.log logs/JieZ_2017.log
 ps -p "$(cat logs/datasets.pid)" -o pid,etime,%cpu,%mem,rss,cmd
 ps --ppid "$(cat logs/datasets.pid)" -o pid,etime,%cpu,%mem,rss,cmd
 ```
+
+## Top-K method comparison
+
+This run compares all six real datasets and synthetic `full_signals` for every
+main-preset sample size and seed. Each method is checkpointed, so the same
+command skips matching completed work.
+
+```bash
+nohup env PYTHONUNBUFFERED=1 \
+  COMPARISON_SOURCE=all SYNTHETIC_PRESET=main \
+  COMPARISON_CPUS=24 COMPARISON_REAL_WORKERS=3 \
+  COMPARISON_SYNTHETIC_WORKERS=5 \
+  .venv/bin/python scripts/run_method_comparison.py \
+  > logs/method_comparison.log 2>&1 &
+long_run_pid=$!
+echo "$long_run_pid" | tee logs/method_comparison.pid
+```
+
+Use `COMPARISON_SOURCE=real` or `synthetic` to restrict the run. Worker counts
+control concurrent datasets, while `COMPARISON_CPUS` bounds the total native
+thread budget. Monitor it with:
+
+```bash
+tail -f logs/method_comparison.log
+ps -p "$(cat logs/method_comparison.pid)" -o pid,etime,%cpu,%mem,rss,cmd
+```
+
+Regenerate tables and figures without rerunning any method:
+
+```bash
+.venv/bin/python scripts/summarize_method_comparison.py
+```
+
+Outputs are saved under `outputs/method_comparison/`. Other synthetic scenarios
+are intentionally ignored by this comparison.

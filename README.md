@@ -24,6 +24,9 @@ pip install -r requirements.txt
 See [RUNNING.md](RUNNING.md) for CPU limits, memory limits, background `nohup`
 runs, logs, monitoring, and stopping a process.
 
+See [SCIENTIFIC_PIPELINE.md](SCIENTIFIC_PIPELINE.md) for the concise mathematical
+description of the real-data pipeline and synthetic generation and evaluation.
+
 Use [notebooks/preprocessed_dataset_analysis.ipynb](notebooks/preprocessed_dataset_analysis.ipynb)
 for a sparse-safe overview of any completed preprocessing output.
 
@@ -157,15 +160,25 @@ shown as four AUROC panels with one common data-driven y-axis range.
 Block prevalences range from 1% to 40%, giving approximately 90% zeros overall
 while keeping selected pair signals above the prevalence filter. The main
 preset uses 50 bacteria, 10,000 genes, 10 bacteria clusters, 100 gene clusters,
-four strong pair signals, sample sizes 150/250/350, and three seeds. It is
+four strong pair signals, sample sizes 150/250/350/500, and seven seeds. It is
 intentionally not the default. See [RUNNING.md](RUNNING.md) for the background
 commands. Synthetic generation and evaluation use five independent worker
 processes by default; set `SYNTHETIC_WORKERS` to change the concurrency.
 
+## Top-K comparison
+
+`scripts/run_method_comparison.py` compares BH-ranked pairs, bacteria averages,
+gene averages, co-clustered marginals, and co-clustered marginals plus residual
+pairs. It uses the six cross-sectional real datasets and only synthetic
+`full_signals`. Expensive method results are cached independently, while
+`scripts/summarize_method_comparison.py` rebuilds tables and figures from those
+caches. Every per-K result records bacteria, gene, pair, and total columns. The
+scientific selector no longer imposes a fixed 200-feature cap.
+
 ## Validation completed
 
-The compact unit suite passes nineteen scientific-invariant tests. The current
-smoke preset completes all six scenarios, exactly recovers the noiseless block
+The compact unit suite covers the scientific invariants. The current smoke
+preset completes all six scenarios, exactly recovers the noiseless block
 memberships, obtains 100% PPJoin candidate recall, produces 90.6% zeros, and
 retains both planted pairs after training prevalence filtering. It does not
 recover those pair signals at `n=40`. The smoke preset validates code paths

@@ -38,6 +38,8 @@ request when it conflicts with this file.
 - Do not add factorization, random projection, approximate-neighbor, workflow,
   or distributed-computing dependencies until simple experiments justify them.
 - Update README.md and RESEARCH_PLAN.md when behavior or conclusions change.
+- Keep SCIENTIFIC_PIPELINE.md synchronized with every change to scientific
+  preprocessing, transformations, clustering, selection, modeling, or evaluation.
 
 ## Checks
 

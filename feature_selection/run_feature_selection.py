@@ -28,7 +28,6 @@ MAX_CLUSTER_ROUNDS = 2
 SCREEN_FDR = 0.10
 PAIR_CANDIDATES_PER_BLOCK = 2
 PAIR_L1_C = 0.033
-MAX_SELECTED_PER_LEVEL = 200
 HOLDOUT_TEST_FRACTION = 0.20
 INNER_FOLDS = 3
 HOLDOUT_SEED = 42
@@ -70,13 +69,11 @@ def predict_model(train_x, train_y, test_x, model_seed=MODEL_SEED):
     return model.predict_proba(test_x)[:, 1]
 
 
-def selected_columns(matrix, y, screen_fdr=SCREEN_FDR, limit=MAX_SELECTED_PER_LEVEL):
+def selected_columns(matrix, y, screen_fdr=SCREEN_FDR):
     if matrix.shape[1] == 0:
         return np.array([], dtype=int), None
     p, q, effect, auc = mann_whitney_scores(matrix, y)
     selected = np.flatnonzero(q <= screen_fdr)
-    if len(selected) > limit:
-        selected = selected[np.argsort(q[selected])[:limit]]
     table = pd.DataFrame({
         "column": np.arange(matrix.shape[1]),
         "p": p,
@@ -101,7 +98,7 @@ def outcome_residuals(features, y, splits, model_seed=MODEL_SEED):
     return y - probability
 
 
-def residual_pair_features(
+def fit_sequential_selector(
     pair_train,
     pair_test,
     pair_blocks,
@@ -109,11 +106,10 @@ def residual_pair_features(
     y,
     candidates_per_block=PAIR_CANDIDATES_PER_BLOCK,
     pair_l1_c=PAIR_L1_C,
-    max_selected=MAX_SELECTED_PER_LEVEL,
     inner_folds_count=INNER_FOLDS,
     model_seed=MODEL_SEED,
 ):
-    """Select block-residual pairs without letting one block fill the shortlist."""
+    """Fit the current conditional pair selector and expose its fitted details."""
     if candidates_per_block <= 0 or pair_l1_c <= 0:
         raise ValueError("Pair candidates per block and L1 C must be positive")
     splits = inner_splits(y, inner_folds_count, model_seed)
@@ -146,13 +142,46 @@ def residual_pair_features(
         ),
     )
     selector.fit(selection_train, y)
-    pair_coefficient = selector[-1].coef_.ravel()[marg_train.shape[1] :]
-    selected = np.flatnonzero(pair_coefficient != 0)
-    if len(selected) > max_selected:
-        selected = selected[
-            np.argsort(-np.abs(pair_coefficient[selected]), kind="stable")[:max_selected]
-        ]
-    return residual_train[:, selected], residual_test[:, selected], candidates[selected]
+    coefficient = selector[-1].coef_.ravel()
+    return {
+        "candidates": candidates,
+        "pair_scores": pair_score[candidates],
+        "residual_train": residual_train,
+        "residual_test": residual_test,
+        "marginal_coefficients": coefficient[:marg_train.shape[1]],
+        "pair_coefficients": coefficient[marg_train.shape[1]:],
+    }
+
+
+def residual_pair_features(
+    pair_train,
+    pair_test,
+    pair_blocks,
+    marg_train,
+    y,
+    candidates_per_block=PAIR_CANDIDATES_PER_BLOCK,
+    pair_l1_c=PAIR_L1_C,
+    inner_folds_count=INNER_FOLDS,
+    model_seed=MODEL_SEED,
+):
+    """Return every residual pair receiving a nonzero L1 coefficient."""
+    details = fit_sequential_selector(
+        pair_train,
+        pair_test,
+        pair_blocks,
+        marg_train,
+        y,
+        candidates_per_block,
+        pair_l1_c,
+        inner_folds_count,
+        model_seed,
+    )
+    selected = np.flatnonzero(details["pair_coefficients"] != 0)
+    return (
+        details["residual_train"][:, selected],
+        details["residual_test"][:, selected],
+        details["candidates"][selected],
+    )
 
 
 def cluster_training_representations(
@@ -263,7 +292,6 @@ def holdout_representations(
     jaccard_threshold=JACCARD_THRESHOLD,
     max_cluster_rounds=MAX_CLUSTER_ROUNDS,
     screen_fdr=SCREEN_FDR,
-    max_selected=MAX_SELECTED_PER_LEVEL,
     verbose=False,
 ):
     """Learn clusters and supervised marginal screens from the training split."""
@@ -284,10 +312,10 @@ def holdout_representations(
     gene_cluster_train, gene_cluster_test = matrices["gene_clusters"]
 
     selected_b, _ = selected_columns(
-        sqrt_sparse(bacteria_cluster_train), y_train, screen_fdr, max_selected
+        sqrt_sparse(bacteria_cluster_train), y_train, screen_fdr
     )
     selected_g, _ = selected_columns(
-        sqrt_sparse(gene_cluster_train), y_train, screen_fdr, max_selected
+        sqrt_sparse(gene_cluster_train), y_train, screen_fdr
     )
     b_train = sqrt_sparse(bacteria_cluster_train[:, selected_b])
     b_test = sqrt_sparse(bacteria_cluster_test[:, selected_b])
@@ -321,7 +349,6 @@ def run_holdout_selection(
     screen_fdr=SCREEN_FDR,
     pair_candidates_per_block=PAIR_CANDIDATES_PER_BLOCK,
     pair_l1_c=PAIR_L1_C,
-    max_selected=MAX_SELECTED_PER_LEVEL,
     test_fraction=HOLDOUT_TEST_FRACTION,
     inner_folds_count=INNER_FOLDS,
     holdout_seed=HOLDOUT_SEED,
@@ -355,7 +382,6 @@ def run_holdout_selection(
         jaccard_threshold,
         max_cluster_rounds,
         screen_fdr,
-        max_selected,
         verbose,
     )
 
@@ -374,7 +400,6 @@ def run_holdout_selection(
         y[train_index],
         pair_candidates_per_block,
         pair_l1_c,
-        max_selected,
         inner_folds_count,
         model_seed,
     )
