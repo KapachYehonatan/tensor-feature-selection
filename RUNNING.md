@@ -210,9 +210,10 @@ feature_selection/run_feature_selection.py
 ```
 
 The selected dataset and research settings remain editable constants near the
-top of each script. Feature selection uses a fixed 80/20 holdout and two
+top of each script. Feature selection uses a fixed 80/20 holdout and up to four
 co-clustering rounds by default; reduce `MAX_CLUSTER_ROUNDS` to `1` only for a
-short exploratory smoke run. Keep `INNER_FOLDS=3` for leakage-safe residuals.
+short exploratory smoke run. Keep `INNER_FOLDS=3` for cross-fitted outcome
+residuals used by the pair test.
 
 ## Parallel real datasets
 
@@ -250,9 +251,36 @@ ps -p "$(cat logs/datasets.pid)" -o pid,etime,%cpu,%mem,rss,cmd
 ps --ppid "$(cat logs/datasets.pid)" -o pid,etime,%cpu,%mem,rss,cmd
 ```
 
+## Build the independent HMP and Nielsen variants
+
+This reads the two original matrices sequentially and writes the day-zero,
+one-sample-per-participant versions under `outputs/preprocessing/`:
+
+```bash
+nohup env PYTHONUNBUFFERED=1 \
+  OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+  NUMEXPR_NUM_THREADS=4 BLIS_NUM_THREADS=4 \
+  /usr/bin/bash -lc '
+    set -e
+    DATASET=HMP_2019_ibdmdb_unique POSITIVE_LABEL=IBD \
+      .venv/bin/python preprocessing/run_preprocessing.py
+    DATASET=NielsenHB_2014_unique POSITIVE_LABEL=IBD \
+      .venv/bin/python preprocessing/run_preprocessing.py
+  ' > logs/unique_preprocessing.log 2>&1 &
+long_run_pid=$!
+echo "$long_run_pid" | tee logs/unique_preprocessing.pid
+```
+
+Monitor it with:
+
+```bash
+tail -f logs/unique_preprocessing.log
+ps -p "$(cat logs/unique_preprocessing.pid)" -o pid,etime,%cpu,%mem,rss,cmd
+```
+
 ## Top-K method comparison
 
-This run compares all six real datasets and synthetic `full_signals` for every
+This run compares all eight real datasets and synthetic `full_signals` for every
 main-preset sample size and seed. Each method is checkpointed, so the same
 command skips matching completed work.
 

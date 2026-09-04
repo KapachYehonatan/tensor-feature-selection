@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare marginal and residual-pair signal with held-out prediction."""
+"""Compare marginal and partial-BH pair signal with held-out prediction."""
 
 from pathlib import Path
 import os
@@ -24,10 +24,8 @@ MINIMUM_SAMPLES = 5
 METRIC = "correlation"
 SIMILARITY_THRESHOLD = 0.93 if METRIC == "correlation" else 0.90
 JACCARD_THRESHOLD = 0.80
-MAX_CLUSTER_ROUNDS = 2
+MAX_CLUSTER_ROUNDS = 4
 SCREEN_FDR = 0.10
-PAIR_CANDIDATES_PER_BLOCK = 2
-PAIR_L1_C = 0.033
 HOLDOUT_TEST_FRACTION = 0.20
 INNER_FOLDS = 3
 HOLDOUT_SEED = 42
@@ -37,7 +35,6 @@ sys.path.insert(0, str(PROJECT))
 from research_utils import (  # noqa: E402
     aggregate_columns,
     grouped_partial_correlation_scores,
-    grouped_residual_features,
     mann_whitney_scores,
     marginal_matrix,
     normalize_rows,
@@ -98,90 +95,49 @@ def outcome_residuals(features, y, splits, model_seed=MODEL_SEED):
     return y - probability
 
 
-def fit_sequential_selector(
-    pair_train,
-    pair_test,
+def pair_bh_scores(
+    transformed_pair_train,
     pair_blocks,
     marg_train,
     y,
-    candidates_per_block=PAIR_CANDIDATES_PER_BLOCK,
-    pair_l1_c=PAIR_L1_C,
     inner_folds_count=INNER_FOLDS,
     model_seed=MODEL_SEED,
 ):
-    """Fit the current conditional pair selector and expose its fitted details."""
-    if candidates_per_block <= 0 or pair_l1_c <= 0:
-        raise ValueError("Pair candidates per block and L1 C must be positive")
+    """Return all-pair partial-correlation p/q-values."""
     splits = inner_splits(y, inner_folds_count, model_seed)
     outcome_residual = outcome_residuals(marg_train, y, splits, model_seed)
-    transformed_train = sqrt_sparse(pair_train)
-    transformed_test = sqrt_sparse(pair_test)
-    pair_score, _, _ = grouped_partial_correlation_scores(
-        transformed_train, outcome_residual, pair_blocks
+    effect, p, q = grouped_partial_correlation_scores(
+        transformed_pair_train, outcome_residual, pair_blocks
     )
-    candidates = []
-    for block in np.unique(pair_blocks):
-        members = np.flatnonzero(pair_blocks == block)
-        order = np.argsort(-np.abs(pair_score[members]), kind="stable")
-        candidates.extend(members[order[:candidates_per_block]])
-    candidates = np.asarray(candidates, dtype=int)
-    residual_train, residual_test = grouped_residual_features(
-        transformed_train, transformed_test, pair_blocks, candidates
-    )
-
-    selection_train = sparse.hstack([marg_train, residual_train], format="csr")
-    selector = make_pipeline(
-        StandardScaler(with_mean=False),
-        LogisticRegression(
-            C=pair_l1_c,
-            l1_ratio=1,
-            class_weight="balanced",
-            max_iter=2000,
-            random_state=model_seed,
-            solver="liblinear",
-        ),
-    )
-    selector.fit(selection_train, y)
-    coefficient = selector[-1].coef_.ravel()
-    return {
-        "candidates": candidates,
-        "pair_scores": pair_score[candidates],
-        "residual_train": residual_train,
-        "residual_test": residual_test,
-        "marginal_coefficients": coefficient[:marg_train.shape[1]],
-        "pair_coefficients": coefficient[marg_train.shape[1]:],
-    }
+    return {"p": p, "q": q, "effect": effect}
 
 
-def residual_pair_features(
+def pair_bh_features(
     pair_train,
     pair_test,
     pair_blocks,
     marg_train,
     y,
-    candidates_per_block=PAIR_CANDIDATES_PER_BLOCK,
-    pair_l1_c=PAIR_L1_C,
+    screen_fdr=SCREEN_FDR,
     inner_folds_count=INNER_FOLDS,
     model_seed=MODEL_SEED,
 ):
-    """Return every residual pair receiving a nonzero L1 coefficient."""
-    details = fit_sequential_selector(
-        pair_train,
-        pair_test,
-        pair_blocks,
-        marg_train,
-        y,
-        candidates_per_block,
-        pair_l1_c,
-        inner_folds_count,
-        model_seed,
+    """Return raw pair features passing the adjusted all-pair BH test."""
+    transformed_train = sqrt_sparse(pair_train)
+    transformed_test = sqrt_sparse(pair_test)
+    scores = pair_bh_scores(
+        transformed_train, pair_blocks, marg_train, y, inner_folds_count, model_seed
     )
-    selected = np.flatnonzero(details["pair_coefficients"] != 0)
-    return (
-        details["residual_train"][:, selected],
-        details["residual_test"][:, selected],
-        details["candidates"][selected],
-    )
+    p, q, effect = scores["p"], scores["q"], scores["effect"]
+    selected = np.flatnonzero(q <= screen_fdr)
+    return {
+        "selected": selected,
+        "train": transformed_train[:, selected],
+        "test": transformed_test[:, selected],
+        "p": p,
+        "q": q,
+        "effect": effect,
+    }
 
 
 def cluster_training_representations(
@@ -347,8 +303,6 @@ def run_holdout_selection(
     jaccard_threshold=JACCARD_THRESHOLD,
     max_cluster_rounds=MAX_CLUSTER_ROUNDS,
     screen_fdr=SCREEN_FDR,
-    pair_candidates_per_block=PAIR_CANDIDATES_PER_BLOCK,
-    pair_l1_c=PAIR_L1_C,
     test_fraction=HOLDOUT_TEST_FRACTION,
     inner_folds_count=INNER_FOLDS,
     holdout_seed=HOLDOUT_SEED,
@@ -392,17 +346,18 @@ def run_holdout_selection(
         )
 
     marg_train, marg_test = representations["marginal_clusters"]
-    pair_train, pair_test, selected_pairs = residual_pair_features(
+    pair_result = pair_bh_features(
         details["pair_train"],
         details["pair_test"],
         details["pair_blocks"],
         marg_train,
         y[train_index],
-        pair_candidates_per_block,
-        pair_l1_c,
+        screen_fdr,
         inner_folds_count,
         model_seed,
     )
+    pair_train, pair_test = pair_result["train"], pair_result["test"]
+    selected_pairs = pair_result["selected"]
     combined_train = sparse.hstack([marg_train, pair_train], format="csr")
     combined_test = sparse.hstack([marg_test, pair_test], format="csr")
     if len(selected_pairs):
@@ -497,6 +452,9 @@ def run_holdout_selection(
     )]
     selected_pair_indices = np.flatnonzero(details["pair_mask"])[selected_pairs]
     details["selected_pairs"] = selected_pairs
+    details["pair_p"] = pair_result["p"]
+    details["pair_q"] = pair_result["q"]
+    details["pair_effect"] = pair_result["effect"]
 
     if verbose:
         print(

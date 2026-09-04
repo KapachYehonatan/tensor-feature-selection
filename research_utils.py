@@ -42,6 +42,38 @@ def write_lines(path, values):
             handle.write(f"{value}\n")
 
 
+def unique_day_zero_stool_mask(subjects, body_sites, days, reads, sample_ids):
+    """Select one day-zero stool sample per subject, preferring read depth."""
+    subjects = np.asarray(subjects, dtype=object)
+    body_sites = np.asarray(body_sites, dtype=object)
+    days = np.asarray(days, dtype=float)
+    reads = np.asarray(reads, dtype=float)
+    sample_ids = np.asarray(sample_ids, dtype=str)
+    if len({len(subjects), len(body_sites), len(days), len(reads), len(sample_ids)}) != 1:
+        raise ValueError("Baseline-selection columns must have equal lengths")
+
+    selected = np.zeros(len(subjects), dtype=bool)
+    best = {}
+    for index in np.flatnonzero(
+        np.array([isinstance(value, str) and bool(value) for value in subjects])
+        & (np.char.lower(body_sites.astype(str)) == "stool")
+        & (days == 0)
+    ):
+        subject = subjects[index]
+        incumbent = best.get(subject)
+        read_count = reads[index] if np.isfinite(reads[index]) else -np.inf
+        if incumbent is None:
+            best[subject] = index
+            continue
+        incumbent_reads = reads[incumbent] if np.isfinite(reads[incumbent]) else -np.inf
+        if read_count > incumbent_reads or (
+            read_count == incumbent_reads and sample_ids[index] < sample_ids[incumbent]
+        ):
+            best[subject] = index
+    selected[list(best.values())] = True
+    return selected
+
+
 def sample_support(matrix):
     """Count the samples with a positive value for each feature."""
     matrix = sparse.csr_matrix(matrix)
@@ -417,7 +449,7 @@ def similarity_coclustering(
     similarity_threshold=0.95,
     jaccard_threshold=0.80,
     metric="correlation",
-    rounds=3,
+    rounds=4,
     return_diagnostics=False,
     collect_checked_pairs=False,
     verbose=False,

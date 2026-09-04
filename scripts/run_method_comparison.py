@@ -15,7 +15,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 SOURCE = os.environ.get("COMPARISON_SOURCE", "all")  # all, real, or synthetic
 REAL_DATASETS = "all"
 SYNTHETIC_PRESET = os.environ.get("SYNTHETIC_PRESET", "main")
-K_VALUES = [50, 100, 150, 200, 250, 300, 350, 400, 500, 600]
+K_VALUES = [5, 10, 20, 35, 50, 60, 75, 85, 100]
 TEST_FRACTION = 0.20
 HOLDOUT_SEED = 42
 MODEL_SEED = 42
@@ -24,24 +24,24 @@ MINIMUM_SAMPLES = 5
 METRIC = "correlation"
 SIMILARITY_THRESHOLD = 0.93
 JACCARD_THRESHOLD = 0.80
-MAX_CLUSTER_ROUNDS = 2
+MAX_CLUSTER_ROUNDS = 4
 SCREEN_FDR = 0.10
 RSP_FDR = 0.05
 RSP_BETA = 0.05
 RSP_PERMUTATIONS = 5
 RSP_SEED = 2026
-PAIR_CANDIDATES_PER_BLOCK = 2
-PAIR_L1_C = 0.033
 MANN_WHITNEY_CHUNK = 2000
 TOTAL_CPUS = int(os.environ.get("COMPARISON_CPUS", "24"))
 MAX_REAL_WORKERS = int(os.environ.get("COMPARISON_REAL_WORKERS", "3"))
 MAX_SYNTHETIC_WORKERS = int(os.environ.get("COMPARISON_SYNTHETIC_WORKERS", "5"))
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 OUTPUT_ROOT = PROJECT / "outputs/method_comparison"
 
 REAL_LABELS = {
+    "HMP_2019_ibdmdb_unique": "IBD",
     "JieZ_2017": "ACVD",
     "LiJ_2017": "hypertension",
+    "NielsenHB_2014_unique": "IBD",
     "QinJ_2012": "T2D",
     "RubelMA_2020": "STH",
     "WirbelJ_2018": "CRC",
@@ -52,7 +52,7 @@ METHOD_LABELS = {
     "bh_bacteria": "BH Top-K bacteria-collapsed",
     "bh_genes": "BH Top-K gene-collapsed",
     "clustered_marginals": "Marginal co-clustering Top-K",
-    "clustered_plus_pairs": "Marginal co-clustering + residual pairs",
+    "clustered_plus_pairs": "Marginal co-clustering + partial-BH pairs",
 }
 METHODS = list(METHOD_LABELS)
 
@@ -80,9 +80,8 @@ from sklearn.model_selection import StratifiedShuffleSplit  # noqa: E402
 sys.path.insert(0, str(PROJECT))
 from feature_selection.run_feature_selection import (  # noqa: E402
     cluster_training_representations,
-    fit_sequential_selector,
+    pair_bh_scores,
     predict_model,
-    selected_columns,
 )
 from research_utils import (  # noqa: E402
     benjamini_hochberg,
@@ -168,7 +167,7 @@ def run_signature(job, y, files):
         "model_seed": MODEL_SEED,
         "prevalence": [PREVALENCE_FRACTION, MINIMUM_SAMPLES],
         "clustering": [METRIC, SIMILARITY_THRESHOLD, JACCARD_THRESHOLD, MAX_CLUSTER_ROUNDS],
-        "selection": [SCREEN_FDR, PAIR_CANDIDATES_PER_BLOCK, PAIR_L1_C],
+        "selection": [SCREEN_FDR, "partial_correlation_bh"],
         "rsp": [RSP_FDR, RSP_BETA, RSP_PERMUTATIONS, RSP_SEED],
     }
     digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode())
@@ -255,6 +254,7 @@ def bh_family(matrix, targets):
         "q": real_q,
         "effect": effect,
         "discoveries": discoveries,
+        "p_values": p_values,
     }
 
 
@@ -281,7 +281,6 @@ def feature_table(order, levels, ids, scores, maximum=None):
         "p": np.asarray(scores.get("p", np.full(len(levels), np.nan)))[order],
         "q": np.asarray(scores.get("q", np.full(len(levels), np.nan)))[order],
         "effect": np.asarray(scores.get("effect", np.full(len(levels), np.nan)))[order],
-        "coefficient": np.asarray(scores.get("coefficient", np.full(len(levels), np.nan)))[order],
     })
 
 
@@ -447,20 +446,23 @@ def run_job(job):
     for method, (source_train, source_test, levels, ids) in simple_spaces.items():
         method_started = perf_counter()
         result = bh_family(source_train, targets)
-        ranking = feature_table(result["order"], levels, ids, result, maximum)
-        ranked_train = source_train[:, result["order"][:maximum]]
-        ranked_test = source_test[:, result["order"][:maximum]]
+        selected_order = result["order"][result["q"][result["order"]] <= SCREEN_FDR]
+        ranking = feature_table(selected_order, levels, ids, result, maximum)
+        selected = feature_table(selected_order, levels, ids, result)
+        ranked_train = source_train[:, selected_order[:maximum]]
+        ranked_test = source_test[:, selected_order[:maximum]]
         output_counts = {
             "bacteria": int(np.sum(levels == "bacterium")),
             "gene": int(np.sum(levels == "gene")),
             "pair": int(np.sum(levels == "pair")),
         }
+        discoveries = len(selected_order)
         metrics, predictions = evaluate_ranked(
             method, ranked_train, ranked_test, ranking, y_train, y_test, output_counts,
             {
-                "bacteria": result["discoveries"][0] if method == "bh_bacteria" else 0,
-                "gene": result["discoveries"][0] if method == "bh_genes" else 0,
-                "pair": result["discoveries"][0] if method == "bh_pairs" else 0,
+                "bacteria": discoveries if method == "bh_bacteria" else 0,
+                "gene": discoveries if method == "bh_genes" else 0,
+                "pair": discoveries if method == "bh_pairs" else 0,
             },
         )
         rsp = add_job_values(rsp_row(method, result["discoveries"]), job)
@@ -468,7 +470,7 @@ def run_job(job):
         add_job_columns(predictions, job)
         save_method(
             destination / method, signature, ranking, ranked_train, ranked_test,
-            metrics, predictions, rsp, runtime=perf_counter() - method_started,
+            metrics, predictions, rsp, selected, perf_counter() - method_started,
         )
     simple_spaces.clear()
 
@@ -481,54 +483,59 @@ def run_job(job):
         bacteria_test = sqrt_sparse(matrices["bacteria_clusters"][1])
         gene_train = sqrt_sparse(matrices["gene_clusters"][0])
         gene_test = sqrt_sparse(matrices["gene_clusters"][1])
-        bacteria_bh = gene_bh = None
+        bacteria_bh = bh_family(bacteria_train, targets)
+        gene_bh = bh_family(gene_train, targets)
+        levels = np.concatenate([
+            np.full(bacteria_train.shape[1], "bacterium"),
+            np.full(gene_train.shape[1], "gene"),
+        ])
+        ids = np.concatenate([
+            np.arange(bacteria_train.shape[1]), np.arange(gene_train.shape[1])
+        ])
+        combined_scores = {
+            key: np.concatenate([bacteria_bh[key], gene_bh[key]])
+            for key in ("p", "q", "effect")
+        }
+        type_order = np.concatenate([
+            np.zeros(bacteria_train.shape[1], dtype=int),
+            np.ones(gene_train.shape[1], dtype=int),
+        ])
+        combined_order = np.lexsort(
+            (ids, type_order, combined_scores["p"], combined_scores["q"])
+        )
+        selected_marginal_order = combined_order[
+            combined_scores["q"][combined_order] <= SCREEN_FDR
+        ]
+        combined_train = sparse.hstack([bacteria_train, gene_train], format="csr")
+        combined_test = sparse.hstack([bacteria_test, gene_test], format="csr")
+        marginal_train = combined_train[:, selected_marginal_order]
+        marginal_test = combined_test[:, selected_marginal_order]
+        marginal_counts = {
+            "bacteria": int(np.sum(levels[selected_marginal_order] == "bacterium")),
+            "gene": int(np.sum(levels[selected_marginal_order] == "gene")),
+            "pair": 0,
+        }
+        output_counts = {
+            "bacteria": bacteria_train.shape[1],
+            "gene": gene_train.shape[1],
+            "pair": 0,
+        }
 
         if "clustered_marginals" in missing:
             method_started = perf_counter()
-            bacteria_bh = bh_family(bacteria_train, targets)
-            gene_bh = bh_family(gene_train, targets)
-            levels = np.concatenate([
-                np.full(bacteria_train.shape[1], "bacterium"),
-                np.full(gene_train.shape[1], "gene"),
-            ])
-            ids = np.concatenate([
-                np.arange(bacteria_train.shape[1]), np.arange(gene_train.shape[1])
-            ])
-            combined_scores = {
-                key: np.concatenate([bacteria_bh[key], gene_bh[key]])
-                for key in ("p", "q", "effect")
-            }
-            type_order = np.concatenate([
-                np.zeros(bacteria_train.shape[1], dtype=int),
-                np.ones(gene_train.shape[1], dtype=int),
-            ])
-            combined_order = np.lexsort(
-                (ids, type_order, combined_scores["p"], combined_scores["q"])
+            ranking = feature_table(
+                selected_marginal_order, levels, ids, combined_scores, maximum
             )
-            combined_train = sparse.hstack([bacteria_train, gene_train], format="csr")
-            combined_test = sparse.hstack([bacteria_test, gene_test], format="csr")
-            ranking = feature_table(combined_order, levels, ids, combined_scores, maximum)
-            ranked_train = combined_train[:, combined_order[:maximum]]
-            ranked_test = combined_test[:, combined_order[:maximum]]
-            output_counts = {
-                "bacteria": bacteria_train.shape[1], "gene": gene_train.shape[1], "pair": 0,
-            }
+            selected = feature_table(
+                selected_marginal_order, levels, ids, combined_scores
+            )
+            ranked_train = marginal_train[:, :maximum]
+            ranked_test = marginal_test[:, :maximum]
             metrics, predictions = evaluate_ranked(
                 "clustered_marginals", ranked_train, ranked_test, ranking,
-                y_train, y_test, output_counts,
-                {
-                    "bacteria": int(np.sum(
-                        (combined_scores["q"] <= SCREEN_FDR) & (levels == "bacterium")
-                    )),
-                    "gene": int(np.sum(
-                        (combined_scores["q"] <= SCREEN_FDR) & (levels == "gene")
-                    )),
-                    "pair": 0,
-                },
+                y_train, y_test, output_counts, marginal_counts,
             )
             discoveries = np.asarray(bacteria_bh["discoveries"]) + np.asarray(gene_bh["discoveries"])
-            selected_order = combined_order[combined_scores["q"][combined_order] <= SCREEN_FDR]
-            selected = feature_table(selected_order, levels, ids, combined_scores)
             add_job_columns(metrics, job)
             add_job_columns(predictions, job)
             save_method(
@@ -540,84 +547,76 @@ def run_job(job):
 
         if "clustered_plus_pairs" in missing:
             method_started = perf_counter()
-            if bacteria_bh is None:
-                selected_b, bacteria_table = selected_columns(
-                    bacteria_train, y_train, SCREEN_FDR
-                )
-                selected_g, gene_table = selected_columns(
-                    gene_train, y_train, SCREEN_FDR
-                )
-            else:
-                selected_b = np.flatnonzero(bacteria_bh["q"] <= SCREEN_FDR)
-                selected_g = np.flatnonzero(gene_bh["q"] <= SCREEN_FDR)
-                bacteria_table = pd.DataFrame({
-                    key: bacteria_bh[key] for key in ("p", "q", "effect")
-                })
-                gene_table = pd.DataFrame({
-                    key: gene_bh[key] for key in ("p", "q", "effect")
-                })
-            marginal_train = sparse.hstack([
-                bacteria_train[:, selected_b], gene_train[:, selected_g]
-            ], format="csr")
-            marginal_test = sparse.hstack([
-                bacteria_test[:, selected_b], gene_test[:, selected_g]
-            ], format="csr")
-            sequential = fit_sequential_selector(
-                details["pair_train"], details["pair_test"], details["pair_blocks"],
-                marginal_train, y_train, PAIR_CANDIDATES_PER_BLOCK, PAIR_L1_C,
+            transformed_pair_train = sqrt_sparse(details["pair_train"])
+            transformed_pair_test = sqrt_sparse(details["pair_test"])
+            pair_result = pair_bh_scores(
+                transformed_pair_train, details["pair_blocks"],
+                marginal_train, y_train,
             )
-            marginal_levels = np.concatenate([
-                np.full(len(selected_b), "bacterium"), np.full(len(selected_g), "gene")
+            pair_selected = np.flatnonzero(pair_result["q"] <= SCREEN_FDR)
+            all_levels = np.concatenate([
+                levels[selected_marginal_order], np.full(len(pair_selected), "pair")
             ])
-            marginal_ids = np.concatenate([selected_b, selected_g])
-            marginal_p = np.concatenate([
-                bacteria_table.loc[selected_b, "p"], gene_table.loc[selected_g, "p"]
+            all_ids = np.concatenate([
+                ids[selected_marginal_order], original_pairs[pair_selected]
             ])
-            marginal_q = np.concatenate([
-                bacteria_table.loc[selected_b, "q"], gene_table.loc[selected_g, "q"]
+            scores = {
+                key: np.concatenate([
+                    combined_scores[key][selected_marginal_order], pair_result[key][pair_selected]
+                ])
+                for key in ("p", "q", "effect")
+            }
+            type_code = np.array([
+                {"bacterium": 0, "gene": 1, "pair": 2}[level]
+                for level in all_levels
             ])
-            marginal_effect = np.concatenate([
-                bacteria_table.loc[selected_b, "effect"], gene_table.loc[selected_g, "effect"]
-            ])
-            pair_ids = original_pairs[sequential["candidates"]]
-            all_levels = np.concatenate([marginal_levels, np.full(len(pair_ids), "pair")])
-            all_ids = np.concatenate([marginal_ids, pair_ids])
-            coefficients = np.concatenate([
-                sequential["marginal_coefficients"], sequential["pair_coefficients"]
-            ])
-            keep = np.flatnonzero(coefficients != 0)
-            candidate_train = sparse.hstack([
-                marginal_train, sequential["residual_train"]
-            ], format="csr")[:, keep]
-            candidate_test = sparse.hstack([
-                marginal_test, sequential["residual_test"]
-            ], format="csr")[:, keep]
-            kept_levels, kept_ids, kept_coefficients = all_levels[keep], all_ids[keep], coefficients[keep]
-            p_all = np.concatenate([marginal_p, np.full(len(pair_ids), np.nan)])[keep]
-            q_all = np.concatenate([marginal_q, np.full(len(pair_ids), np.nan)])[keep]
-            effect_all = np.concatenate([marginal_effect, sequential["pair_scores"]])[keep]
-            type_code = np.array([{"bacterium": 0, "gene": 1, "pair": 2}[level] for level in kept_levels])
-            order = np.lexsort((kept_ids, type_code, -np.abs(kept_coefficients)))
-            scores = {"p": p_all, "q": q_all, "effect": effect_all, "coefficient": kept_coefficients}
-            selected = feature_table(order, kept_levels, kept_ids, scores)
+            order = np.lexsort((all_ids, type_code, scores["p"], scores["q"]))
+            selected = feature_table(order, all_levels, all_ids, scores)
             ranking = selected.iloc[:maximum].copy()
-            ranked_train = candidate_train[:, order[:maximum]]
-            ranked_test = candidate_test[:, order[:maximum]]
-            output_counts = {
-                "bacteria": int(np.sum(kept_levels == "bacterium")),
-                "gene": int(np.sum(kept_levels == "gene")),
-                "pair": int(np.sum(kept_levels == "pair")),
+            selected_train = sparse.hstack([
+                marginal_train, transformed_pair_train[:, pair_selected]
+            ], format="csr")
+            selected_test = sparse.hstack([
+                marginal_test, transformed_pair_test[:, pair_selected]
+            ], format="csr")
+            ranked_train = selected_train[:, order[:maximum]]
+            ranked_test = selected_test[:, order[:maximum]]
+            combined_output_counts = {
+                **output_counts, "pair": details["pair_train"].shape[1],
+            }
+            selected_counts = {
+                **marginal_counts, "pair": len(pair_selected),
             }
             metrics, predictions = evaluate_ranked(
                 "clustered_plus_pairs", ranked_train, ranked_test, ranking,
-                y_train, y_test, output_counts,
+                y_train, y_test, combined_output_counts, selected_counts,
+            )
+
+            pair_discoveries = [int(np.sum(pair_result["q"] <= RSP_FDR))]
+            for target_number, target in enumerate(targets[1:], start=1):
+                bacteria_q = benjamini_hochberg(bacteria_bh["p_values"][target_number])
+                gene_q = benjamini_hochberg(gene_bh["p_values"][target_number])
+                permuted_marginal = sparse.hstack([
+                    bacteria_train[:, bacteria_q <= SCREEN_FDR],
+                    gene_train[:, gene_q <= SCREEN_FDR],
+                ], format="csr")
+                permuted_pair = pair_bh_scores(
+                    transformed_pair_train, details["pair_blocks"],
+                    permuted_marginal, target,
+                )
+                pair_discoveries.append(int(np.sum(permuted_pair["q"] <= RSP_FDR)))
+            discoveries = (
+                np.asarray(bacteria_bh["discoveries"])
+                + np.asarray(gene_bh["discoveries"])
+                + np.asarray(pair_discoveries)
             )
             add_job_columns(metrics, job)
             add_job_columns(predictions, job)
             save_method(
                 destination / "clustered_plus_pairs", signature, ranking,
                 ranked_train, ranked_test, metrics, predictions,
-                selected=selected, runtime=perf_counter() - method_started,
+                add_job_values(rsp_row("clustered_plus_pairs", discoveries), job),
+                selected, perf_counter() - method_started,
             )
 
     print(

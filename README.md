@@ -52,8 +52,9 @@ For preprocessing and feature selection over one or more datasets, edit
 ```
 
 `DATASETS` accepts `"all"`, one dataset name, or a list of names. `"all"`
-means the six configured cross-sectional healthy-versus-disease studies:
-JieZ_2017, LiJ_2017, QinJ_2012, RubelMA_2020, WirbelJ_2018, and ZhuF_2020.
+means the eight configured independent-sample healthy-versus-disease studies:
+HMP_2019_ibdmdb_unique, JieZ_2017, LiJ_2017, NielsenHB_2014_unique,
+QinJ_2012, RubelMA_2020, WirbelJ_2018, and ZhuF_2020.
 Up to three datasets run concurrently by default, while each dataset's two
 steps remain sequential. A failed dataset skips its later steps without
 stopping the other active datasets. Logs and current child PIDs are written per
@@ -88,6 +89,9 @@ ties deterministically.
 
 ### 3. Feature selection
 
+The two `_unique` studies use one exact day-zero stool sample per participant;
+day-zero duplicates are resolved by greatest read count and then sample ID.
+
 `feature_selection/run_feature_selection.py` uses one fixed stratified 80/20
 train/holdout split (seed `42`) for these representations:
 
@@ -95,19 +99,18 @@ train/holdout split (seed `42`) for these representations:
 - bacteria clusters;
 - gene clusters;
 - bacteria and gene clusters;
-- selected residual gene-bacterium pairs alone, when any pair is selected;
-- selected marginals plus residual gene-bacterium pairs.
+- selected partial-BH gene-bacterium pairs alone, when any pair is selected;
+- selected marginals plus partial-BH gene-bacterium pairs.
 
 The training split uses Mann-Whitney screening with Benjamini-Hochberg
-correction and two alternating co-clustering rounds by default.
+correction and up to four alternating co-clustering rounds by default.
 The pair stage first residualizes the outcome with the selected marginal model.
 It then scores every pair after removing its learned bacteria-cluster ×
-gene-cluster block aggregate, keeps the two strongest candidates per block,
-and uses sparse logistic selection to avoid filling the model with hundreds of
-equivalent neighbors from one block. The held-out increment in AUROC and
-average precision is the primary evidence for pair-level signal. These are
-exploratory predictive results, not causal or formal conditional-independence
-claims.
+gene-cluster block aggregate and applies BH across all retained pairs. Pairs
+with `q <= 0.10` are selected; there is no candidate cap or L1 selection stage.
+The held-out increment in AUROC and average precision is the primary evidence
+for pair-level signal. These are exploratory predictive results, not causal or
+formal conditional-independence claims.
 
 The analysis stops if preprocessing or a training-derived prevalence mask
 leaves any sample with no retained abundance.
@@ -168,9 +171,9 @@ processes by default; set `SYNTHETIC_WORKERS` to change the concurrency.
 ## Top-K comparison
 
 `scripts/run_method_comparison.py` compares BH-ranked pairs, bacteria averages,
-gene averages, co-clustered marginals, and co-clustered marginals plus residual
-pairs. It uses the six cross-sectional real datasets and only synthetic
-`full_signals`. Expensive method results are cached independently, while
+gene averages, co-clustered marginals, and co-clustered marginals plus
+partial-BH pairs. It uses the eight independent-sample real datasets and only
+synthetic `full_signals`. Expensive method results are cached independently, while
 `scripts/summarize_method_comparison.py` rebuilds tables and figures from those
 caches. Every per-K result records bacteria, gene, pair, and total columns. The
 scientific selector no longer imposes a fixed 200-feature cap.
@@ -184,12 +187,6 @@ retains both planted pairs after training prevalence filtering. It does not
 recover those pair signals at `n=40`. The smoke preset validates code paths
 only; signal-recovery conclusions require the reviewed main experiment across
 sample sizes and seeds.
-
-A limited pre-rerun validation used only `n=350`, seeds `202` and `303`. In the
-pair-only scenario, pair recall was `0.750` for both seeds, precision was
-`1.000` and `0.600`, and held-out AUROC was `0.813` and `0.746` at the final
-`C=0.033` setting. One matched null run selected one pair. These checks justify
-a full rerun but do not replace it.
 
 See [RESEARCH_PLAN.md](RESEARCH_PLAN.md) for hypotheses, comparisons, and stop
 conditions. Data provenance is in [data/README.md](data/README.md).

@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import json
+import os
 
 import matplotlib
 
@@ -17,7 +18,14 @@ ROOT = PROJECT / "outputs/method_comparison"
 FIGURES = ROOT / "figures"
 TABLES = ROOT / "tables"
 METRICS = ["auroc", "precision", "recall", "f1"]
-CACHE_VERSION = 5
+CACHE_VERSION = 6
+SYNTHETIC_PRESET = os.environ.get("SYNTHETIC_PRESET", "main")
+CONFIGURATION = json.loads((PROJECT / "synthetic_config.json").read_text(encoding="utf-8"))
+PRESET = CONFIGURATION["presets"][SYNTHETIC_PRESET]
+SYNTHETIC_RUNS = {
+    (f"n_{int(n)}", f"seed_{int(seed)}")
+    for n in PRESET["sample_sizes"] for seed in PRESET["seeds"]
+}
 METHOD_ORDER = [
     "bh_pairs", "bh_bacteria", "bh_genes",
     "clustered_marginals", "clustered_plus_pairs",
@@ -32,6 +40,8 @@ def read_cached(filename):
         if marker.get("cache_version") == CACHE_VERSION:
             tables.append(pd.read_csv(path))
     for path in sorted(ROOT.glob(f"synthetic/n_*/seed_*/full_signals/*/{filename}")):
+        if (path.parents[3].name, path.parents[2].name) not in SYNTHETIC_RUNS:
+            continue
         marker = json.loads((path.parent / "complete.json").read_text(encoding="utf-8"))
         if marker.get("cache_version") == CACHE_VERSION:
             tables.append(pd.read_csv(path))

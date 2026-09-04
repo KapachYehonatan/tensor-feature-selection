@@ -21,6 +21,11 @@ configured disease class, encoded as $Y=0$ and $Y=1$. Pair columns absent
 from every retained sample are removed. A sample with no remaining classified
 abundance causes the analysis to stop rather than being imputed.
 
+`HMP_2019_ibdmdb_unique` and `NielsenHB_2014_unique` are cross-sectional
+versions of longitudinal sources. They retain one stool sample collected at
+day zero per participant. If several day-zero samples exist, the one with the
+greatest read count is retained; sample ID breaks an exact tie.
+
 The prevalence count reported during preprocessing is only a whole-dataset
 preview. It does not determine the features used for prediction.
 
@@ -102,7 +107,7 @@ highest and assigned to the qualifying representative with greatest abundance
 similarity, then greatest Jaccard similarity. Every member therefore passes
 both thresholds directly against its representative; similarity chains are
 not used. This deterministic ordering can affect the resulting partition.
-Alternation stops when both label vectors are unchanged or after two rounds.
+Alternation stops when both label vectors are unchanged or after four rounds.
 There is no global co-clustering objective or guarantee of convergence before
 that limit.
 
@@ -114,7 +119,7 @@ C^G_{ic}=\sum_{k:c_G(k)=c}G_{ik}.
 $$
 
 The standalone script in `clustering/` is descriptive and uses the complete
-dataset, correlation threshold 0.95, and up to three rounds. Its clusters are
+dataset, correlation threshold 0.95, and up to four rounds. Its clusters are
 not reused for prediction; feature selection relearns clusters from its
 training split using the rules above.
 
@@ -158,30 +163,23 @@ V_{ie}=\sqrt{\widetilde X_{ie}},\qquad
 Z_{ih}=\sum_{e:h(e)=h}V_{ie}.
 $$
 
-Every pair is ranked by the absolute partial correlation
+Every pair receives the partial correlation
 
 $$
 \left|\operatorname{corr}(V_{\cdot e},r^Y\mid Z_{\cdot h(e)})\right|.
 $$
 
-Only the two strongest pairs per learned block become candidates. For each
-candidate, training data fit
+The usual partial-correlation $t$ approximation provides a $p$-value for every
+prevalence-retained pair. Benjamini–Hochberg adjustment is applied once across
+the complete pair family, and every pair with $q\leq0.10$ is selected. There is
+no per-block candidate cap or L1 selection stage. Pair BH correction is
+separate from the bacteria- and gene-cluster BH families.
 
-$$
-V_{ie}=a_e+\lambda_e Z_{i,h(e)}+R_{ie},
-$$
-
-and the fitted $a_e,\lambda_e$ are applied unchanged to the test set. A
-class-balanced L1 logistic regression with $C=0.033$ is then fitted to the
-selected marginal features and candidate residuals $R_e$. Its columns are
-variance-scaled without mean-centering. Every pair with a nonzero coefficient
-is selected; there is no fixed feature-count cap.
-
-This is linear adjustment for one learned block aggregate plus an out-of-fold
+This is adjustment for one learned block aggregate plus an out-of-fold
 marginal outcome model. It is not a copula decomposition or a formal test of
-conditional independence. The pair partial-correlation p-values are not used
-for selection, and the L1 stage has no pair-level FDR guarantee; null synthetic
-experiments are used to measure false discoveries empirically.
+conditional independence. The selected raw square-root pair values are used
+for prediction alongside the marginal clusters; null and label-permutation
+experiments assess false discoveries empirically.
 
 ## 6. Prediction and interpretation
 
@@ -190,8 +188,8 @@ Separate class-balanced L2 logistic models with $C=1$ compare:
 - selected bacteria-cluster features;
 - selected gene-cluster features;
 - both selected marginal levels;
-- selected residual pairs alone, when any are selected;
-- selected marginals plus selected residual pairs;
+- selected partial-BH pairs alone, when any are selected;
+- selected marginals plus selected partial-BH pairs;
 - an intercept-only reference.
 
 Scaling is learned on the training set; sparse features are scaled but not
@@ -316,23 +314,23 @@ empirical estimate of false discovery rate, not a formal guarantee.
 The comparison reuses the training-only holdout split, prevalence filter,
 closure, square-root transformation, co-clustering, and prediction model. It
 compares BH-ranked pair features, bacteria averages, gene averages,
-co-clustered marginals, and co-clustered marginals plus residual pairs at
+co-clustered marginals, and co-clustered marginals plus partial-BH pairs at
 
 $$
-K\in\{50,100,150,200,250,300,350,400,500,600\}.
+K\in\{5,10,20,35,50,60,75,85,100\}.
 $$
 
 Collapsed bacteria and gene features are averages of their retained pair
-columns. The first four methods rank features by training-set BH-adjusted $q$,
-then raw $p$ and a stable identifier. The marginal co-clustering method applies
-BH separately to bacteria and gene clusters before merging the rankings. The
-combined method uses every $q\leq0.10$ marginal cluster and every nonzero
-residual-pair L1 coefficient, then ranks all nonzero coefficients by absolute
-magnitude. Every result records bacteria, gene, pair, and total model columns.
+columns. Every method retains only features with training-set $q\leq0.10$ and
+ranks them by adjusted $q$, raw $p$, feature type, and stable identifier. The
+marginal co-clustering method applies BH separately to bacteria and gene
+clusters. Its extension keeps those exact marginal features and q-values, then
+adds pairs passing the separate all-pair partial-correlation BH test. Every
+result records bacteria, gene, pair, and total model columns.
 
 Held-out AUROC, precision, recall, and F1 use the current class-balanced L2
 logistic model; binary metrics threshold its probability at 0.5. RSP is
-reported only for the four BH-defined methods:
+reported for all five BH-defined methods:
 
 $$
 \operatorname{RSP}=\frac{0.05RP-SP}{0.05RP+SP},

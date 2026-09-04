@@ -14,6 +14,11 @@ from scipy.io import mmread
 PROJECT = Path("/home/kapachy/Microbium/tensor_feature_selection")
 SOURCE_ROOT = Path("/home/kapachy/Microbium/projects/cMD_downloads")
 DATASET = os.environ.get("DATASET", "WirbelJ_2018")
+SOURCE_DATASETS = {
+    "HMP_2019_ibdmdb_unique": "HMP_2019_ibdmdb",
+    "NielsenHB_2014_unique": "NielsenHB_2014",
+}
+SOURCE_DATASET = SOURCE_DATASETS.get(DATASET, DATASET)
 TARGET_COLUMN = "disease"
 NEGATIVE_LABEL = "healthy"
 POSITIVE_LABEL = os.environ.get("POSITIVE_LABEL", "CRC")
@@ -22,7 +27,11 @@ MINIMUM_SAMPLES = 5
 OUTPUT = PROJECT / "outputs/preprocessing" / DATASET
 
 sys.path.insert(0, str(PROJECT))
-from research_utils import prevalence_mask, write_lines  # noqa: E402
+from research_utils import (  # noqa: E402
+    prevalence_mask,
+    unique_day_zero_stool_mask,
+    write_lines,
+)
 
 
 def parse_pair_names(path):
@@ -61,6 +70,8 @@ def align_metadata(path, sample_ids):
     metadata = pd.read_csv(path, sep="\t", low_memory=False)
     sample_column = "sample_id" if "sample_id" in metadata else "SampleID"
     required = {sample_column, TARGET_COLUMN}
+    if DATASET in SOURCE_DATASETS:
+        required.update({"subject_id", "body_site", "days_from_first_collection", "number_reads"})
     missing = required - set(metadata)
     if missing:
         raise ValueError(f"Missing metadata columns: {sorted(missing)}")
@@ -68,10 +79,20 @@ def align_metadata(path, sample_ids):
         raise ValueError("Metadata sample IDs must be unique")
     metadata = metadata.set_index(sample_column).reindex(sample_ids)
     labels = metadata[TARGET_COLUMN].astype(str)
-    keep = labels.isin([NEGATIVE_LABEL, POSITIVE_LABEL]).to_numpy()
+    keep = labels.isin([NEGATIVE_LABEL, POSITIVE_LABEL]).to_numpy(copy=True)
+    if DATASET in SOURCE_DATASETS:
+        keep &= unique_day_zero_stool_mask(
+            metadata["subject_id"].to_numpy(),
+            metadata["body_site"].to_numpy(),
+            pd.to_numeric(metadata["days_from_first_collection"], errors="coerce"),
+            pd.to_numeric(metadata["number_reads"], errors="coerce"),
+            sample_ids,
+        )
     if not keep.any():
         raise ValueError("No samples match the configured binary labels")
     selected = metadata.iloc[np.flatnonzero(keep)].copy()
+    if DATASET in SOURCE_DATASETS and selected["subject_id"].duplicated().any():
+        raise RuntimeError("Unique baseline selection retained a repeated subject")
     selected.insert(0, "sample_id", selected.index.astype(str))
     selected["y"] = labels[keep].map({NEGATIVE_LABEL: 0, POSITIVE_LABEL: 1}).to_numpy()
     return selected.reset_index(drop=True), keep
@@ -80,11 +101,11 @@ def align_metadata(path, sample_ids):
 if not 0 < PREVALENCE_FRACTION <= 1:
     raise ValueError("PREVALENCE_FRACTION must be in (0, 1]")
 
-study = SOURCE_ROOT / DATASET
-matrix_path = study / f"{DATASET}_gene_families.mtx"
-feature_path = study / f"{DATASET}_genes.txt"
-sample_path = study / f"{DATASET}_samples.txt"
-metadata_path = study / f"{DATASET}_metadata.tsv"
+study = SOURCE_ROOT / SOURCE_DATASET
+matrix_path = study / f"{SOURCE_DATASET}_gene_families.mtx"
+feature_path = study / f"{SOURCE_DATASET}_genes.txt"
+sample_path = study / f"{SOURCE_DATASET}_samples.txt"
+metadata_path = study / f"{SOURCE_DATASET}_metadata.tsv"
 for path in [matrix_path, feature_path, sample_path, metadata_path]:
     if not path.exists():
         raise FileNotFoundError(path)
@@ -140,7 +161,12 @@ np.savez_compressed(
     global_support=support,
     global_mask=mask,
 )
-samples[["sample_id", TARGET_COLUMN, "y"]].to_csv(
+sample_columns = ["sample_id", TARGET_COLUMN, "y"]
+if DATASET in SOURCE_DATASETS:
+    sample_columns[1:1] = [
+        "subject_id", "body_site", "days_from_first_collection", "number_reads"
+    ]
+samples[sample_columns].to_csv(
     OUTPUT / "samples.csv", index=False
 )
 write_lines(OUTPUT / "genes.txt.gz", genes)
@@ -148,7 +174,10 @@ write_lines(OUTPUT / "bacteria.txt.gz", bacteria)
 pd.DataFrame(
     [{
         "dataset": DATASET,
+        "source_dataset": SOURCE_DATASET,
+        "cohort_rule": "one_day_zero_stool_per_subject" if DATASET in SOURCE_DATASETS else "all_labeled_samples",
         "samples": matrix.shape[0],
+        "subjects": samples["subject_id"].nunique() if "subject_id" in samples else matrix.shape[0],
         "negative": int((samples["y"] == 0).sum()),
         "positive": int((samples["y"] == 1).sum()),
         "valid_pairs": matrix.shape[1],

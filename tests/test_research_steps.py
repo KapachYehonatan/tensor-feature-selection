@@ -25,14 +25,17 @@ from research_utils import (  # noqa: E402
     prediction_matrix,
     prevalence_mask,
     similarity_clusters,
+    unique_day_zero_stool_mask,
 )
 from run_datasets import MAX_PARALLEL_DATASETS, N_CPUS, cpu_allocation, datasets_to_run
 from feature_selection.run_feature_selection import (
-    residual_pair_features,
+    pair_bh_features,
     run_holdout_selection,
     selected_columns,
 )
 from scripts.run_method_comparison import (
+    K_VALUES,
+    MAX_CLUSTER_ROUNDS,
     bh_family,
     collapsed_average,
     evaluate_ranked,
@@ -53,27 +56,31 @@ from scripts.generate_synthetic import (  # noqa: E402
 
 
 class ResearchStepTests(unittest.TestCase):
+    def test_comparison_budget_and_clustering_rounds(self):
+        self.assertEqual(K_VALUES, [5, 10, 20, 35, 50, 60, 75, 85, 100])
+        self.assertEqual(MAX_CLUSTER_ROUNDS, 4)
+
     def test_marginal_and_pair_selection_have_no_200_feature_cap(self):
         y = np.repeat([0, 1], 10)
         values = np.tile(y[:, None], (1, 225))
         selected, _ = selected_columns(sparse.csr_matrix(values), y)
         self.assertEqual(len(selected), 225)
 
-        details = {
-            "candidates": np.arange(225),
-            "residual_train": sparse.csr_matrix(np.ones((20, 225))),
-            "residual_test": sparse.csr_matrix(np.ones((4, 225))),
-            "pair_coefficients": np.ones(225),
+        scores = {
+            "p": np.zeros(225), "q": np.zeros(225), "effect": np.ones(225)
         }
         with patch(
-            "feature_selection.run_feature_selection.fit_sequential_selector",
-            return_value=details,
+            "feature_selection.run_feature_selection.pair_bh_scores",
+            return_value=scores,
         ):
-            train, test, pairs = residual_pair_features(
+            result = pair_bh_features(
                 sparse.csr_matrix((20, 225)), sparse.csr_matrix((4, 225)),
                 np.arange(225), sparse.csr_matrix((20, 0)), y,
             )
-        self.assertEqual((train.shape[1], test.shape[1], len(pairs)), (225, 225, 225))
+        self.assertEqual(
+            (result["train"].shape[1], result["test"].shape[1], len(result["selected"])),
+            (225, 225, 225),
+        )
 
     def test_comparison_collapsed_average_and_feature_counts(self):
         matrix = sparse.csr_matrix([[2.0, 4.0, 3.0], [0.0, 2.0, 6.0]])
@@ -120,6 +127,23 @@ class ResearchStepTests(unittest.TestCase):
             write_completion(cache, "abc")
             self.assertTrue(is_complete(cache, "abc"))
             self.assertFalse(is_complete(cache, "different"))
+
+    def test_pair_test_returns_direct_bh_values(self):
+        rng = np.random.default_rng(1)
+        y = np.repeat([0, 1], 30)
+        values = np.column_stack([
+            3 * y,
+            rng.binomial(1, 0.5, len(y)),
+            rng.binomial(1, 0.5, len(y)),
+            rng.binomial(1, 0.5, len(y)),
+        ]).astype(float)
+        result = pair_bh_features(
+            sparse.csr_matrix(values), sparse.csr_matrix(values[:10]),
+            np.array([0, 0, 1, 1]), sparse.csr_matrix((len(y), 0)), y,
+        )
+        np.testing.assert_allclose(result["q"], benjamini_hochberg(result["p"]))
+        self.assertIn(0, result["selected"])
+        self.assertNotIn(2, result["selected"])
 
     def test_comparison_uses_only_full_signal_synthetic_jobs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -200,13 +224,20 @@ class ResearchStepTests(unittest.TestCase):
             selected = np.arange(selected_count)
 
             def pairs(pair_train, pair_test, *_args, **_kwargs):
-                return pair_train[:, :selected_count], pair_test[:, :selected_count], selected
+                return {
+                    "train": pair_train[:, :selected_count],
+                    "test": pair_test[:, :selected_count],
+                    "selected": selected,
+                    "p": np.ones(pair_train.shape[1]),
+                    "q": np.ones(pair_train.shape[1]),
+                    "effect": np.zeros(pair_train.shape[1]),
+                }
 
             with patch(
                 "feature_selection.run_feature_selection.holdout_representations",
                 side_effect=representations,
             ), patch(
-                "feature_selection.run_feature_selection.residual_pair_features",
+                "feature_selection.run_feature_selection.pair_bh_features",
                 side_effect=pairs,
             ), patch(
                 "feature_selection.run_feature_selection.predict_model",
@@ -233,12 +264,24 @@ class ResearchStepTests(unittest.TestCase):
     def test_dataset_runner_accepts_all_one_or_list(self):
         all_datasets = datasets_to_run("all")
         self.assertIn("WirbelJ_2018", all_datasets)
+        self.assertIn("HMP_2019_ibdmdb_unique", all_datasets)
+        self.assertIn("NielsenHB_2014_unique", all_datasets)
         self.assertNotIn("BrooksB_2017", all_datasets)
         self.assertEqual(datasets_to_run("WirbelJ_2018"), ["WirbelJ_2018"])
         self.assertEqual(
             datasets_to_run(["WirbelJ_2018", "QinJ_2012"]),
             ["WirbelJ_2018", "QinJ_2012"],
         )
+
+    def test_unique_baseline_prefers_read_depth(self):
+        selected = unique_day_zero_stool_mask(
+            ["A", "A", "B", "C", "D"],
+            ["stool", "stool", "stool", "oralcavity", "stool"],
+            [0, 0, 1, 0, 0],
+            [10, 20, 30, 40, np.nan],
+            ["a1", "a2", "b1", "c1", "d1"],
+        )
+        np.testing.assert_array_equal(selected, [False, True, False, False, True])
 
     def test_dataset_runner_cpu_allocation(self):
         workers, threads, cpus = cpu_allocation(6, range(N_CPUS + 4))

@@ -20,9 +20,8 @@ accounted for.
 5. Fit a ridge-logistic marginal model and calculate out-of-fold outcome
    residuals within the training data.
 6. Score every pair against the outcome residual after removing its learned
-   co-cluster block aggregate, retain two candidates per block, and use sparse
-   logistic selection on these residual pair features.
-7. Compare held-out prediction before and after adding residual pairs.
+   co-cluster block aggregate, then apply BH across all retained pairs.
+7. Compare held-out prediction before and after adding significant pairs.
 
 ## Experiments
 
@@ -31,13 +30,13 @@ accounted for.
 | Prevalence | raw versus retained pairs and mass | initial information loss |
 | Marginals | intercept, bacteria, genes, both | signal at each dimension |
 | Clustering | planted versus recovered clusters in synthetic data | recovery and aggregation fidelity |
-| Pairs | pairs alone, marginals, and marginals plus residual pairs | pair signal and its added value beyond marginals |
+| Pairs | pairs alone, marginals, and marginals plus partial-BH pairs | pair signal and its added value beyond marginals |
 | Holdout | fixed stratified 80/20 split | fast exploratory prediction estimate |
 | Stability | final repeated folds, if justified | reproducibility of selected entities |
 | Synthetic blocks | exact versus dropout/member noise | cluster recovery and aggregation loss |
 | Synthetic target | null, marginal, pair-only, marginal plus pairs | attribution and false discoveries by level |
 | Synthetic scale | 150/250/350/500 samples over seven seeds | recovery, stability, runtime, and peak memory |
-| Top-K baselines | pairs, collapsed marginals, clustered marginals, and residual pairs | prediction versus feature budget |
+| Top-K baselines | pairs, collapsed marginals, clustered marginals, and partial-BH pairs | prediction versus feature budget |
 
 ## Synthetic design
 
@@ -93,8 +92,10 @@ separates pair recovery from failures in marginal nuisance estimation.
 
 ## Top-K comparison
 
-Use the six cross-sectional real datasets and synthetic `full_signals`. Compare
-ten K values from 50 through 600 with one shared training-only 80/20 holdout.
+Use the eight independent-sample real datasets and synthetic `full_signals`.
+The HMP and Nielsen longitudinal sources contribute one exact day-zero stool
+sample per participant. Compare
+$K\in\{5,10,20,35,50,60,75,85,100\}$ with one shared training-only 80/20 holdout.
 Report AUROC, precision, recall, F1, biological feature counts, and BH RSP where
 defined. Average synthetic seeds within sample size before giving sample sizes
 equal weight. The scientific pipeline has no fixed 200-feature cap; K limits

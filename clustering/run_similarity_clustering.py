@@ -18,7 +18,7 @@ MINIMUM_SAMPLES = 5
 METRIC = "correlation"  # Change to "bray_curtis" for the one sensitivity run.
 SIMILARITY_THRESHOLD = 0.95 if METRIC == "correlation" else 0.90
 JACCARD_THRESHOLD = 0.80
-MAX_ROUNDS = 3
+MAX_ROUNDS = 4
 
 sys.path.insert(0, str(PROJECT))
 from research_utils import (  # noqa: E402

@@ -13,8 +13,10 @@ DATASETS = "all"  # Use one name or a list such as ["WirbelJ_2018", "QinJ_2012"]
 MAX_PARALLEL_DATASETS = 3
 N_CPUS = 24  # Total CPUs shared by all concurrently running datasets.
 POSITIVE_LABELS = {
+    "HMP_2019_ibdmdb_unique": "IBD",
     "JieZ_2017": "ACVD",
     "LiJ_2017": "hypertension",
+    "NielsenHB_2014_unique": "IBD",
     "QinJ_2012": "T2D",
     "RubelMA_2020": "STH",
     "WirbelJ_2018": "CRC",
