@@ -36,6 +36,7 @@ accounted for.
 | Synthetic blocks | exact versus dropout/member noise | cluster recovery and aggregation loss |
 | Synthetic target | null, marginal, pair-only, marginal plus pairs | attribution and false discoveries by level |
 | Synthetic scale | 150/250/350/500 samples over seven seeds | recovery, stability, runtime, and peak memory |
+| Exact detection joins | Bernoulli correlation and literal Jaccard at 0.70 | standardized detection correlation versus support overlap |
 | Top-K baselines | pairs, collapsed marginals, clustered marginals, and partial-BH pairs | prediction versus feature budget |
 
 ## Synthetic design
@@ -100,3 +101,14 @@ Report AUROC, precision, recall, F1, biological feature counts, and BH RSP where
 defined. Average synthetic seeds within sample size before giving sample sizes
 equal weight. The scientific pipeline has no fixed 200-feature cap; K limits
 only each comparison model, not the underlying selection output.
+
+The real-data comparison additionally evaluates Bernoulli-correlation-join.
+After the common training prevalence filter it builds the exact graph of pair
+detection columns with absolute standardized Bernoulli correlation initially at
+least 0.70, applies weighted Leiden, averages original normalized abundances within
+communities, and performs BH Top-K testing. It is deliberately unaware of the
+bacteria--gene factorization. The exact join is run sequentially by dataset and
+must stop explicitly rather than switch to an approximate neighbor method when
+a configured resource limit is reached. When Leiden's conservative workspace
+estimate is too large, already verified edges are filtered at the smallest
+0.05 threshold increment that fits; correlations are not recomputed.

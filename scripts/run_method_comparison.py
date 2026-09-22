@@ -49,12 +49,17 @@ REAL_LABELS = {
 }
 METHOD_LABELS = {
     "bh_pairs": "BH Top-K pairs",
+    "bh_pairs_bacteria": "BH Top-K pairs + bacteria-collapsed",
     "bh_bacteria": "BH Top-K bacteria-collapsed",
     "bh_genes": "BH Top-K gene-collapsed",
     "clustered_marginals": "Marginal co-clustering Top-K",
     "clustered_plus_pairs": "Marginal co-clustering + partial-BH pairs",
+    "bernoulli_correlation_join": "Bernoulli-correlation-join",
+    "jaccard_join": "Jaccard join",
 }
-METHODS = list(METHOD_LABELS)
+METHODS = [
+    "bh_bacteria", "bh_genes", "clustered_plus_pairs",
+]
 
 if SOURCE not in {"all", "real", "synthetic"}:
     raise ValueError("COMPARISON_SOURCE must be all, real, or synthetic")
@@ -313,12 +318,13 @@ def evaluate_ranked(
             "bacteria_features": int(counts.get("bacterium", 0)),
             "gene_features": int(counts.get("gene", 0)),
             "pair_features": int(counts.get("pair", 0)),
+            "pair_cluster_features": int(counts.get("pair_cluster", 0)),
             "total_features": effective_k,
             **{f"output_{level}_features": int(output_counts.get(level, 0))
-               for level in ("bacteria", "gene", "pair")},
+               for level in ("bacteria", "gene", "pair", "pair_cluster")},
             "output_total_features": int(sum(output_counts.values())),
             **{f"selected_{level}_features": int(selected_counts.get(level, 0))
-               for level in ("bacteria", "gene", "pair")},
+               for level in ("bacteria", "gene", "pair", "pair_cluster")},
             "selected_total_features": int(sum(selected_counts.values())),
             **scores,
         })
@@ -331,7 +337,10 @@ def evaluate_ranked(
     return pd.DataFrame(rows), pd.DataFrame(predictions)
 
 
-def save_method(path, signature, ranking, train, test, metrics, predictions, rsp=None, selected=None, runtime=0.0):
+def save_method(
+    path, signature, ranking, train, test, metrics, predictions, rsp=None,
+    selected=None, runtime=0.0, completion_extra=None,
+):
     path.mkdir(parents=True, exist_ok=True)
     ranking.to_csv(path / "ranked_features.csv.gz", index=False, compression="gzip")
     sparse.save_npz(path / "ranked_train.npz", train, compressed=True)
@@ -349,6 +358,7 @@ def save_method(path, signature, ranking, train, test, metrics, predictions, rsp
     write_completion(path, signature, {
         "runtime_seconds": runtime,
         "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+        **(completion_extra or {}),
     })
 
 

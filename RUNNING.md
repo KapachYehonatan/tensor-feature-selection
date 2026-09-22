@@ -83,7 +83,7 @@ After evaluation finishes, export the repeated-run figures in the foreground:
 
 The plotting script averages independent seeds within each sample size and
 scenario, shows their standard deviation and individual observations, and
-writes PNG/PDF figures plus averaged CSV scores under
+writes PNG figures plus averaged CSV scores under
 `outputs/synthetic_evaluation/main/figures/`.
 
 Generation runs independent `(sample size, seed)` configurations concurrently;
@@ -310,5 +310,85 @@ Regenerate tables and figures without rerunning any method:
 .venv/bin/python scripts/summarize_method_comparison.py
 ```
 
+This also writes `synthetic_discovery_metrics.csv` and the PNG
+`synthetic_discovery` figure for corrected FDP, FPR, and power across sample
+sizes.
+
+Refit only the cached ranked features and create higher-resolution Top-K plots
+for $K=1,\ldots,10$:
+
+```bash
+.venv/bin/python scripts/plot_fine_k_comparison.py
+```
+
+This does not rerun filtering, testing, clustering, or feature ranking.
+
 Outputs are saved under `outputs/method_comparison/`. Other synthetic scenarios
 are intentionally ignored by this comparison.
+
+Add or resume only the joint BH pairs-plus-bacteria method, then regenerate all
+comparison tables and figures:
+
+```bash
+nohup env PYTHONUNBUFFERED=1 \
+  COMPARISON_SOURCE=all SYNTHETIC_PRESET=main \
+  COMPARISON_CPUS=24 COMPARISON_REAL_WORKERS=3 \
+  COMPARISON_SYNTHETIC_WORKERS=5 \
+  .venv/bin/python scripts/run_pairs_bacteria_comparison.py \
+  > logs/pairs_bacteria_comparison.log 2>&1 &
+long_run_pid=$!
+echo "$long_run_pid" | tee logs/pairs_bacteria_comparison.pid
+```
+
+## Exact detection-join comparisons
+
+The Bernoulli-correlation and literal Jaccard side runs are real-data only. Each
+processes datasets sequentially, starting with the smallest retained pair
+family; they are also run sequentially below. Inside one dataset the external
+exact join uses 36 workers. The limits are 125 GiB per process, 40 GiB join
+working memory, 125 GiB Leiden working memory, 40 GiB output, a 500 GiB
+free-disk reserve, and 64 GiB of memory reserved outside the process. Both
+similarities start at 0.70. Any exact graph above 500 million edges is filtered
+before Leiden in 0.05 threshold increments. A Leiden memory failure triggers
+the next threshold, reusing the stored exact edges rather than recomputing the
+join. The effective threshold is reported per dataset.
+
+```bash
+nohup env PYTHONUNBUFFERED=1 \
+  OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1 \
+  taskset -c 0-35 \
+  prlimit --as=134217728000 \
+  bash -c '.venv/bin/python scripts/run_bernoulli_correlation_join.py && .venv/bin/python scripts/run_jaccard_join.py' \
+  > logs/exact_join_comparison.log 2>&1 &
+long_run_pid=$!
+echo "$long_run_pid" | tee logs/exact_join_comparison.pid
+```
+
+The master log shows dataset transitions. Exact packing, join, and Leiden
+details are written to `logs/bernoulli_join_<dataset>.log` and
+`logs/jaccard_join_<dataset>.log`. Matching completed datasets and base graphs
+are reused on restart. Each method regenerates the coarse and real-only
+$K=1,\ldots,10$ reports after all its datasets succeed.
+
+Monitor the process and the current dataset log with:
+
+```bash
+tail -f logs/exact_join_comparison.log logs/bernoulli_join_*.log logs/jaccard_join_*.log
+ps -p "$(cat logs/exact_join_comparison.pid)" -o pid,etime,%cpu,%mem,rss,cmd
+```
+
+To resume only the Jaccard method, completed datasets are skipped and a
+completed source graph is reused:
+
+```bash
+nohup env PYTHONUNBUFFERED=1 \
+  OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1 \
+  taskset -c 0-35 \
+  prlimit --as=134217728000 \
+  .venv/bin/python scripts/run_jaccard_join.py \
+  > logs/jaccard_remaining.log 2>&1 &
+long_run_pid=$!
+echo "$long_run_pid" | tee logs/jaccard_remaining.pid
+```

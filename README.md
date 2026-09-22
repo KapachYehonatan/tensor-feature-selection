@@ -170,12 +170,19 @@ processes by default; set `SYNTHETIC_WORKERS` to change the concurrency.
 
 ## Top-K comparison
 
-`scripts/run_method_comparison.py` compares BH-ranked pairs, bacteria averages,
-gene averages, co-clustered marginals, and co-clustered marginals plus
-partial-BH pairs. It uses the eight independent-sample real datasets and only
-synthetic `full_signals`. Expensive method results are cached independently, while
+`scripts/run_method_comparison.py` compares bacteria averages, gene averages,
+and co-clustered marginals plus partial-BH pairs. The separately restartable
+`scripts/run_bernoulli_correlation_join.py` adds an exact detection-correlation
+graph method over pair columns, while `scripts/run_jaccard_join.py` adds the
+corresponding literal-support Jaccard baseline. Both start at similarity 0.70
+and stream-filter already verified edges at higher thresholds when the graph
+exceeds the 500-million-edge Leiden cap or an allocation still fails. Current reports
+also include the cached joint pairs-plus-bacteria method, while plain BH pairs
+and marginal-only co-clustering are hidden. The common comparison uses the
+eight independent-sample real datasets and only synthetic `full_signals`;
+Both exact join methods are real-data only. Expensive results are cached independently, while
 `scripts/summarize_method_comparison.py` rebuilds tables and figures from those
-caches. Every per-K result records bacteria, gene, pair, and total columns. The
+caches. Every per-K result records bacteria, gene, pair, pair-cluster, and total columns. The
 scientific selector no longer imposes a fixed 200-feature cap.
 
 ## Validation completed

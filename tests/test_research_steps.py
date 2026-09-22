@@ -44,7 +44,7 @@ from scripts.run_method_comparison import (
     synthetic_jobs,
     write_completion,
 )
-from scripts.summarize_method_comparison import curve_summary, seed_average
+from scripts.summarize_method_comparison import curve_summary, discovery_rates, seed_average
 from scripts.generate_synthetic import (  # noqa: E402
     generate_size,
     load_configuration,
@@ -511,6 +511,13 @@ class ResearchStepTests(unittest.TestCase):
         order = np.argsort(p)
         self.assertTrue(np.all(np.diff(q[order]) >= 0))
         self.assertTrue(np.all((0 <= q) & (q <= 1)))
+
+    def test_discovery_rate_arithmetic(self):
+        rates = discovery_rates(3, 5, 6, 20)
+        self.assertEqual(rates["false_positives"], 2)
+        self.assertAlmostEqual(rates["fdp"], 2 / 5)
+        self.assertAlmostEqual(rates["fpr"], 2 / 14)
+        self.assertAlmostEqual(rates["power"], 3 / 6)
 
     def test_grouped_pair_residuals_remove_block_aggregate(self):
         matrix = sparse.csr_matrix([

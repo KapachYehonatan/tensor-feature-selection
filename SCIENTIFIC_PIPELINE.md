@@ -312,16 +312,19 @@ empirical estimate of false discovery rate, not a formal guarantee.
 ## 9. Top-K method comparison
 
 The comparison reuses the training-only holdout split, prevalence filter,
-closure, square-root transformation, co-clustering, and prediction model. It
-compares BH-ranked pair features, bacteria averages, gene averages,
-co-clustered marginals, and co-clustered marginals plus partial-BH pairs at
+closure, square-root transformation, and prediction model. New reports compare
+the joint pair-plus-bacteria family, bacteria averages, gene averages,
+co-clustered marginals plus partial-BH pairs, the
+Bernoulli-correlation-join, and the Jaccard join at
 
 $$
 K\in\{5,10,20,35,50,60,75,85,100\}.
 $$
 
 Collapsed bacteria and gene features are averages of their retained pair
-columns. Every method retains only features with training-set $q\leq0.10$ and
+columns. The joint method concatenates transformed pairs and collapsed
+bacteria, then applies one BH correction across that combined family. Every
+method retains only features with training-set $q\leq0.10$ and
 ranks them by adjusted $q$, raw $p$, feature type, and stable identifier. The
 marginal co-clustering method applies BH separately to bacteria and gene
 clusters. Its extension keeps those exact marginal features and q-values, then
@@ -330,7 +333,7 @@ result records bacteria, gene, pair, and total model columns.
 
 Held-out AUROC, precision, recall, and F1 use the current class-balanced L2
 logistic model; binary metrics threshold its probability at 0.5. RSP is
-reported for all five BH-defined methods:
+reported for all six displayed BH-defined methods:
 
 $$
 \operatorname{RSP}=\frac{0.05RP-SP}{0.05RP+SP},
@@ -339,3 +342,82 @@ $$
 where $RP$ is the number of $q\leq0.05$ discoveries under real training labels
 and $SP$ is their mean count over five fixed label permutations. Synthetic
 comparisons use `full_signals` only and average seeds within sample size.
+
+Corrected synthetic discoveries are also scored within each method's
+post-filtering hypothesis family:
+
+$$
+\operatorname{FDP}=\frac{FP}{TP+FP},\qquad
+\operatorname{FPR}=\frac{FP}{N},\qquad
+\operatorname{power}=\frac{TP}{P}.
+$$
+
+Individual bacteria and genes are positive when they belong to a planted
+marginal-signal cluster; pairs require the exact planted coordinate. A
+recovered co-cluster is positive when it contains at least one planted marginal
+member. Empty selections have FDP and FPR zero.
+
+### Bernoulli-correlation-join
+
+This real-data-only method treats every retained bacteria--gene pair as an
+ordinary feature; bacteria and gene identities are not used to form clusters.
+On the training samples it binarizes detection,
+
+$$
+Z_{ie}=\mathbf 1(X_{ie}>0),
+$$
+
+and the external exact join finds every edge satisfying
+
+$$
+|\widehat\phi_{ef}|\geq \tau,
+\qquad
+\widehat\phi_{ef}=
+\frac{n a_{ef}-s_es_f}
+{\sqrt{s_es_f(n-s_e)(n-s_f)}}.
+$$
+
+The requested threshold is $\tau=0.70$. Before Leiden, the graph is limited to
+500 million edges, independently of the 125 GiB process limit and the
+partition-table memory estimate. Larger graphs are filtered to the smallest
+threshold in $\{0.75,0.80,\ldots,1.00\}$ that satisfies the cap. If an actual
+Leiden allocation still fails, the next threshold is tried. This filtering is
+exact: stored verified edges are streamed and only edges below the higher
+threshold are removed, without recomputing similarities. The effective
+threshold is recorded for every dataset.
+
+Thus the join is exactly Pearson correlation between standardized Bernoulli
+columns, computed from supports and intersections without forming a correlation
+matrix. Weighted Leiden communities define feature clusters. An all-one
+training column has undefined correlation and remains a singleton; an all-zero
+column after prevalence filtering is an error.
+
+The learned membership is applied to the original, nonbinary relative
+abundances. For cluster $G_h$ the tested feature is
+
+$$
+V_{ih}=\sqrt{\frac{1}{|G_h|}\sum_{e\in G_h}\widetilde X_{ie}}.
+$$
+
+Mann--Whitney tests and one BH correction are then applied across recovered
+clusters. Features with $q\leq0.10$ are ranked by adjusted p-value, raw p-value,
+and stable cluster ID. All filtering, standardization, graph construction, and
+clustering use training samples only.
+
+### Jaccard join
+
+This real-data-only baseline uses the same retained pair detection columns and
+the external exact PPJoin implementation, but skips the minor-state and
+standardized-correlation reduction. It connects two pair features when
+
+$$
+J(S_e,S_f)=\frac{|S_e\cap S_f|}{|S_e\cup S_f|}\geq \tau,
+\qquad S_e=\{i:X_{ie}>0\}.
+$$
+
+It starts at $\tau=0.70$, and weighted Leiden uses the exact Jaccard values.
+Memberships are applied to the original relative abundances with the same mean
+aggregation, square-root transform, Mann--Whitney tests, BH correction, Top-K
+prediction, resource guard, and exact threshold fallback. The only scientific
+difference between the two join methods is the binary similarity used to build
+the graph.

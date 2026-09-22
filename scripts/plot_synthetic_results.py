@@ -111,7 +111,6 @@ def plot_seed_means(
 
 def save_figure(figure, name):
     figure.savefig(FIGURES / f"{name}.png", dpi=DPI, bbox_inches="tight")
-    figure.savefig(FIGURES / f"{name}.pdf", bbox_inches="tight")
     plt.close(figure)
 
 
@@ -376,7 +375,7 @@ def main():
         print("Ignored legacy unclustered_marginals results")
     if "pairs_only" not in present_modes:
         print("pairs_only is absent from these saved runs; rerun evaluation after the model change")
-    print(f"Saved four PNG/PDF figures and averaged score tables to {FIGURES}")
+    print(f"Saved four PNG figures and averaged score tables to {FIGURES}")
 
 
 if __name__ == "__main__":
