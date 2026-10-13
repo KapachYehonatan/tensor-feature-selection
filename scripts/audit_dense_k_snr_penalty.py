@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Report all K for the frozen SNR rule and earlier coverage benchmark."""
+from pathlib import Path
+import sys
+
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+from scripts import audit_dense_k_qinj_penalties as audit
+
+OUTPUT = PROJECT / "outputs/posthoc_penalty_search/dense_k_snr_audit"
+FROZEN_METHODS = {"coverage_snr_power": "coverage_snr_batch_33",
+                  "coverage_power": "coverage_power_batch_23"}
+
+if __name__ == "__main__":
+    audit.OUTPUT, audit.FROZEN_METHODS = OUTPUT, FROZEN_METHODS
+    audit.main()

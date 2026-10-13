@@ -24,6 +24,21 @@ PROJECT = Path(__file__).resolve().parents[1]
 
 
 class BernoulliJoinMethodTests(unittest.TestCase):
+    def test_fixed_threshold_fails_instead_of_raising_threshold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sparse.save_npz(root / "X.npz", sparse.csr_matrix(np.tile([[1],[1],[0],[0]], (1,3))))
+            np.savez(root / "split.npz", train_index=np.arange(4), feature_ids=np.arange(3))
+            result = subprocess.run([str(JOIN_PYTHON), str(PROJECT / "scripts/bernoulli_join_worker.py"),
+                str(root / "X.npz"), str(root / "split.npz"), str(root / "join"),
+                "--threshold", ".7", "--workers", "1", "--memory-gb", "1", "--memory-reserve-gb", "0",
+                "--working-memory-gb", "1", "--community-working-memory-gb", "1",
+                "--output-gb", "1", "--free-disk-gb", "0", "--community-max-edges", "1",
+                "--fixed-threshold"], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Fixed threshold 0.70 requires 3 edges", result.stderr)
+            self.assertFalse((root / "join/integration.json").exists())
+
     def test_memory_fallback_chooses_smallest_fitting_threshold(self):
         self.assertEqual(MAX_COMMUNITY_EDGES, 500_000_000)
         self.assertEqual(
@@ -87,6 +102,7 @@ class BernoulliJoinMethodTests(unittest.TestCase):
                 str(PROJECT / "scripts/bernoulli_join_worker.py"),
                 str(matrix_path), str(split_path), str(output),
                 "--threshold", "0.7", "--workers", "2",
+                "--fixed-threshold", "--community-max-edges", "800000000",
                 "--memory-gb", "1", "--working-memory-gb", "1",
                 "--community-working-memory-gb", "1",
                 "--output-gb", "1", "--free-disk-gb", "0",
@@ -98,6 +114,8 @@ class BernoulliJoinMethodTests(unittest.TestCase):
             )
             with (output / "integration.json").open(encoding="utf-8") as handle:
                 integration = json.load(handle)
+            self.assertTrue(integration["fixed_threshold"])
+            self.assertEqual(integration["community_hard_edge_cap"], 800_000_000)
 
         expected = set()
         for left in range(4):

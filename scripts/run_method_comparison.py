@@ -291,12 +291,14 @@ def feature_table(order, levels, ids, scores, maximum=None):
 
 def evaluate_ranked(
     method, train, test, ranking, y_train, y_test, output_counts,
-    selected_counts=None,
+    selected_counts=None, k_values=None, method_label=None,
 ):
     selected_counts = output_counts if selected_counts is None else selected_counts
+    k_values = K_VALUES if k_values is None else k_values
+    method_label = METHOD_LABELS[method] if method_label is None else method_label
     rows, predictions = [], []
     score_cache = {}
-    for requested_k in K_VALUES:
+    for requested_k in k_values:
         effective_k = min(requested_k, train.shape[1])
         if effective_k not in score_cache:
             probability = predict_model(
@@ -313,7 +315,7 @@ def evaluate_ranked(
         used = ranking.iloc[:effective_k]
         counts = used["level"].value_counts()
         rows.append({
-            "method": method, "method_label": METHOD_LABELS[method],
+            "method": method, "method_label": method_label,
             "requested_k": requested_k, "effective_k": effective_k,
             "bacteria_features": int(counts.get("bacterium", 0)),
             "gene_features": int(counts.get("gene", 0)),

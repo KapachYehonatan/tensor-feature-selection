@@ -203,6 +203,8 @@ def main():
         "--join-method", choices=("bernoulli", "jaccard"), default="bernoulli"
     )
     parser.add_argument("--workers", type=int, default=36)
+    parser.add_argument("--community-workers", type=int, default=None,
+                        help="Leiden workers; defaults to --workers for existing callers")
     parser.add_argument("--memory-gb", type=float, default=125.0)
     parser.add_argument("--working-memory-gb", type=float, default=40.0)
     parser.add_argument("--community-working-memory-gb", type=float, default=125.0)
@@ -210,7 +212,15 @@ def main():
     parser.add_argument("--free-disk-gb", type=float, default=500.0)
     parser.add_argument("--memory-reserve-gb", type=float, default=64.0)
     parser.add_argument("--keep-graph-gb", type=float, default=20.0)
+    parser.add_argument("--community-max-edges", type=int, default=MAX_COMMUNITY_EDGES)
+    parser.add_argument("--fixed-threshold", action="store_true",
+                        help="Fail on resource limits instead of increasing the requested threshold")
     args = parser.parse_args()
+    if args.community_max_edges < 1:
+        raise ValueError("community edge cap must be positive")
+    community_workers = args.workers if args.community_workers is None else args.community_workers
+    if args.workers < 1 or community_workers < 1:
+        raise ValueError("join and community workers must be positive")
 
     required = args.memory_gb + args.memory_reserve_gb
     available = available_memory_gib()
@@ -283,18 +293,21 @@ def main():
     if manifest["status"] != "complete":
         raise RuntimeError(f"exact join stopped: {manifest['status']}: {manifest.get('reason', '')}")
 
-    thresholds = fallback_thresholds(args.threshold)
+    thresholds = [args.threshold] if args.fixed_threshold else fallback_thresholds(args.threshold)
     memory_edge_budget = int(
         COMMUNITY_SAFETY_FRACTION * args.community_working_memory_gb * GIB
         / (PART_DTYPE.itemsize * WORKSPACE_MULTIPLIER)
     )
-    maximum_edges = min(memory_edge_budget, MAX_COMMUNITY_EDGES)
+    maximum_edges = min(memory_edge_budget, args.community_max_edges)
     if manifest["threshold"] == args.threshold and manifest["edge_count"] <= maximum_edges:
         counts = {float(args.threshold): int(manifest["edge_count"])}
         effective_threshold = float(args.threshold)
         community_graph = graph
     else:
         counts = count_threshold_edges(graph, thresholds, manifest, iter_edge_shards)
+        if args.fixed_threshold and counts[args.threshold] > maximum_edges:
+            raise RuntimeError(f"Fixed threshold {args.threshold:.2f} requires {counts[args.threshold]:,} edges; "
+                               f"configured/memory edge limit is {maximum_edges:,}")
         effective_threshold = choose_effective_threshold(counts, maximum_edges)
         if effective_threshold == manifest["threshold"]:
             community_graph = graph
@@ -309,7 +322,7 @@ def main():
             f"Leiden fallback: requested={args.threshold:.2f}, "
             f"effective={effective_threshold:.2f}, edges={counts[effective_threshold]:,}, "
             f"edge_limit={maximum_edges:,} "
-            f"(hard={MAX_COMMUNITY_EDGES:,}, memory={memory_edge_budget:,})",
+            f"(hard={args.community_max_edges:,}, memory={memory_edge_budget:,})",
             flush=True,
         )
     while True:
@@ -317,7 +330,7 @@ def main():
             community = run_community_detection(
                 community_graph, seed=17_729, resolution=1.0,
                 memory_limit_gib=args.memory_gb, output_limit_gib=args.output_gb,
-                free_disk_reserve_gib=args.free_disk_gb, workers=args.workers,
+                free_disk_reserve_gib=args.free_disk_gb, workers=community_workers,
                 working_memory_gib=args.community_working_memory_gb,
             )
             break
@@ -327,6 +340,8 @@ def main():
                 word in message for word in ("memory", "rss", "allocation")
             ):
                 raise
+            if args.fixed_threshold:
+                raise RuntimeError(f"Fixed-threshold Leiden at {args.threshold:.2f} failed its memory guard") from error
             remaining = [value for value in thresholds if value > effective_threshold]
             if not remaining:
                 raise
@@ -399,7 +414,8 @@ def main():
         "threshold_edge_counts": {str(key): value for key, value in counts.items()},
         "community_edge_budget": maximum_edges,
         "community_memory_edge_budget": memory_edge_budget,
-        "community_hard_edge_cap": MAX_COMMUNITY_EDGES,
+        "community_hard_edge_cap": args.community_max_edges,
+        "fixed_threshold": args.fixed_threshold,
         "community_safety_fraction": COMMUNITY_SAFETY_FRACTION,
         "features": int(len(feature_ids)), "clusters": int(len(sizes)),
         "singleton_clusters": int(np.sum(sizes == 1)),

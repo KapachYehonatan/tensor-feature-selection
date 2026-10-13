@@ -37,9 +37,9 @@ request when it conflicts with this file.
 - Leave weakly similar features as singletons.
 - Do not add factorization, random projection, approximate-neighbor, workflow,
   or distributed-computing dependencies until simple experiments justify them.
-- Update README.md and RESEARCH_PLAN.md when behavior or conclusions change.
-- Keep SCIENTIFIC_PIPELINE.md synchronized with every change to scientific
-  preprocessing, transformations, clustering, selection, modeling, or evaluation.
+- Keep README.md concise; update it only when usage or behavior changes.
+- Do not recreate RESEARCH_PLAN.md or SCIENTIFIC_PIPELINE.md unless explicitly
+  requested. Store experiment-specific results in their existing output reports.
 
 ## Checks
 
