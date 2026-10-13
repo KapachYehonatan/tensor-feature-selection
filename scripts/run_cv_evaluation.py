@@ -14,10 +14,8 @@ for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUME
     os.environ[name] = '1'
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
-from research_utils import normalize_rows, prevalence_mask
-from scripts.run_method_comparison import collapsed_average
-from scripts.run_bernoulli_correlation_join import aggregate_pair_clusters, JOIN_PYTHON
-from scripts.run_qinj_redundancy_analysis import screen, evaluate, K_VALUES, SEED
+from research_utils import (normalize_rows, prevalence_mask, collapsed_average,
+    aggregate_pair_clusters, JOIN_PYTHON, screen, evaluate, K_VALUES, SEED, cache_signature)
 import numpy as np
 import pandas as pd
 import scipy
@@ -342,14 +340,10 @@ def report(complete):
     (OUTPUT/'REPORT.md').write_text('\n'.join(lines)+'\n')
 
 
-def main():
-    OUTPUT.mkdir(parents=True, exist_ok=True)
-    paths = [Path(__file__), WORKER, PROJECT/'research_utils.py', PROJECT/'scripts/run_method_comparison.py',
-        PROJECT/'scripts/run_qinj_redundancy_analysis.py', PROJECT/'scripts/run_bernoulli_correlation_join.py',
-        PROJECT/'feature_selection/run_feature_selection.py', JOIN_PYTHON.parents[2]/'bernoulli_join.py',
-        JOIN_PYTHON.parents[2]/'community_detection.py']
+def build_protocol():
+    paths = [Path(__file__), WORKER, PROJECT/'research_utils.py',
+        JOIN_PYTHON.parents[2]/'bernoulli_join.py', JOIN_PYTHON.parents[2]/'community_detection.py']
     paths.extend(PROJECT/'outputs/preprocessing'/d/n for d in DATASETS for n in ('X_valid.npz', 'samples.csv', 'edges.npz'))
-    paths.extend(PROJECT/'outputs/method_comparison'/n for n in ('fine_k_real_metrics.csv', 'metrics_by_k.csv'))
     states = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths]
     code = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths if p.suffix == '.py'}
     versions = json.loads(subprocess.check_output([str(JOIN_PYTHON), '-c',
@@ -363,10 +357,17 @@ def main():
         versions=versions, model_versions=dict(python=sys.version, numpy=np.__version__, scipy=scipy.__version__, sklearn=sklearn.__version__),
         code_hashes=code, source_states=states)
     signature = hashlib.sha256(repr(protocol).encode()).hexdigest()
+    return protocol, signature, paths, states
+
+
+def main():
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    protocol, signature, paths, states = build_protocol()
     manifest = OUTPUT/'protocol.json'
+    signature = cache_signature(manifest, signature)
     if manifest.exists() and json.loads(manifest.read_text())['signature'] != signature:
         raise ValueError('Changed inputs/protocol; preserve existing results and use a new output directory')
-    write_json(manifest, dict(signature=signature, **protocol))
+    if not manifest.exists(): write_json(manifest, dict(signature=signature, **protocol))
     status = [dict(dataset=d, fold=f, status='pending') for d in DATASETS for f in range(FOLDS)]
     complete = []
     report(complete)

@@ -14,13 +14,51 @@ import time
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
-from scripts.launch_bernoulli_clustering_analysis import process_tree, cgroup_values
 
 PREFIX = 'cv_evaluation'
 LIMIT_BYTES = 200*1024**3
 SAMPLE_SECONDS = 5
 RUNNER = PROJECT/'scripts/run_cv_evaluation.py'
 STUDY_OUTPUT = PROJECT/'outputs/cv_evaluation'
+
+
+def process_tree(root):
+    processes = {}
+    for path in Path('/proc').iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            fields = (path/'stat').read_text().rpartition(')')[2].split()
+            processes[int(path.name)] = (int(fields[1]), fields)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    selected = {root}
+    while True:
+        children = {pid for pid, (parent, _) in processes.items() if parent in selected}
+        if children <= selected:
+            break
+        selected |= children
+    rss = cpu = threads = 0
+    for pid in selected & processes.keys():
+        fields = processes[pid][1]
+        rss += int(fields[21])*os.sysconf('SC_PAGE_SIZE')
+        cpu += (int(fields[11])+int(fields[12]))/os.sysconf('SC_CLK_TCK')
+        threads += int(fields[17])
+    return len(selected & processes.keys()), rss, cpu, threads
+
+
+def cgroup_values():
+    relative = next((line.split('::', 1)[1] for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::')), None)
+    if relative is None:
+        return {}
+    root = Path('/sys/fs/cgroup')/relative.lstrip('/')
+    result = {}
+    for name in ('memory.current', 'memory.peak', 'memory.max', 'memory.events', 'cpu.stat'):
+        try:
+            result[name] = (root/name).read_text().strip()
+        except (FileNotFoundError, PermissionError):
+            pass
+    return result
 
 
 def main():

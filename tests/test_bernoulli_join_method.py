@@ -54,10 +54,10 @@ class BernoulliJoinMethodTests(unittest.TestCase):
 
     def test_float32_threshold_boundary_is_counted_consistently(self):
         edges = np.zeros(2, dtype=[
-            ("feature_j", "<u4"), ("feature_k", "<u4"), ("jaccard", "<f4")
+            ("feature_j", "<u4"), ("feature_k", "<u4"), ("phi", "<f4")
         ])
-        edges["jaccard"] = [np.float32(0.9), np.nextafter(np.float32(0.9), 0)]
-        manifest = {"edge_weight": {"field": "jaccard", "transform": "identity"}}
+        edges["phi"] = [np.float32(0.9), np.nextafter(np.float32(0.9), 0)]
+        manifest = {"edge_weight": {"field": "phi", "transform": "abs"}}
         counts = count_threshold_edges(None, [0.9], manifest, lambda unused: [edges])
         self.assertEqual(counts, {0.9: 1})
 
@@ -131,53 +131,6 @@ class BernoulliJoinMethodTests(unittest.TestCase):
         self.assertEqual(integration["requested_threshold"], 0.7)
         self.assertEqual(integration["effective_threshold"], 0.7)
 
-    def test_external_jaccard_worker_matches_brute_force(self):
-        detections = np.column_stack([
-            [1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
-            [1, 1, 1, 1, 0, 1, 0, 0, 0, 0],
-            [1, 1, 1, 0, 0, 1, 1, 0, 0, 0],
-            [0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
-            np.ones(10, dtype=int),
-        ])
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            matrix_path, split_path, output = root / "X.npz", root / "split.npz", root / "result"
-            sparse.save_npz(matrix_path, sparse.csr_matrix(detections))
-            np.savez_compressed(
-                split_path, train_index=np.arange(10), feature_ids=np.arange(5)
-            )
-            subprocess.run([
-                str(JOIN_PYTHON),
-                str(PROJECT / "scripts/bernoulli_join_worker.py"),
-                str(matrix_path), str(split_path), str(output),
-                "--join-method", "jaccard", "--threshold", "0.6",
-                "--workers", "2", "--memory-gb", "1",
-                "--working-memory-gb", "1",
-                "--community-working-memory-gb", "1",
-                "--output-gb", "1", "--free-disk-gb", "0",
-                "--memory-reserve-gb", "0", "--keep-graph-gb", "1",
-            ], check=True, capture_output=True, text=True)
-            observed = set()
-            for shard_path in sorted((output / "graph/edges").glob("part-*.npy")):
-                for row in np.load(shard_path):
-                    observed.add(tuple(sorted((int(row["feature_j"]), int(row["feature_k"])))))
-            integration = json.loads(
-                (output / "integration.json").read_text(encoding="utf-8")
-            )
-            with np.load(output / "assignments.npz") as saved:
-                labels = saved["clusters"]
-
-        expected = set()
-        for left in range(4):
-            for right in range(left + 1, 4):
-                intersection = np.sum(detections[:, left] & detections[:, right])
-                union = np.sum(detections[:, left] | detections[:, right])
-                if intersection / union >= 0.6:
-                    expected.add((left, right))
-        self.assertEqual(observed, expected)
-        self.assertEqual(integration["join_method"], "jaccard")
-        self.assertNotIn(labels[4], labels[:4])
-
     def test_sparse_packing_matches_detection_matrix(self):
         matrix = sparse.csr_matrix([
             [0.0, 2.0, 0.0],
@@ -226,24 +179,14 @@ class BernoulliJoinMethodTests(unittest.TestCase):
         np.testing.assert_array_equal(sizes, [2, 1])
 
     def test_new_reports_expose_only_requested_methods(self):
-        self.assertEqual(
-            METHOD_ORDER,
-            [
-                "bh_pairs_bacteria",
-                "bh_bacteria",
-                "bh_genes",
-                "clustered_plus_pairs",
-                "bernoulli_correlation_join",
-                "jaccard_join",
-            ],
-        )
-        self.assertNotIn("bh_pairs", METHODS)
-        self.assertNotIn("clustered_marginals", METHODS)
+        self.assertEqual(METHOD_ORDER, ['bh_bacteria', 'bh_genes', 'bernoulli_correlation_join'])
+        self.assertEqual(METHODS, METHOD_ORDER)
 
     def test_graph_cache_survives_evaluation_grid_change(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
             (source / "X_valid.npz").write_bytes(b"matrix-fingerprint")
+            (source / "edges.npz").write_bytes(b"pair-mapping-fingerprint")
             (source / "samples.csv").write_text("y\n0\n1\n", encoding="utf-8")
             job = {"input": str(source), "dataset": "tiny"}
             y = np.array([0, 1])

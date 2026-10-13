@@ -200,7 +200,7 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--threshold", type=float, default=0.7)
     parser.add_argument(
-        "--join-method", choices=("bernoulli", "jaccard"), default="bernoulli"
+        "--join-method", choices=("bernoulli",), default="bernoulli"
     )
     parser.add_argument("--workers", type=int, default=36)
     parser.add_argument("--community-workers", type=int, default=None,
@@ -240,7 +240,6 @@ def main():
         directory_bytes, iter_edge_shards, load_packed_dataset, packed_supports,
         ResourceLimit, run_join,
     )
-    from baseline_graphs import run_jaccard_join
     from community_detection import (
         PART_DTYPE, WORKSPACE_MULTIPLIER, run_community_detection,
     )
@@ -256,7 +255,7 @@ def main():
         if not run_path.exists():
             raise RuntimeError("existing output has no completed exact-join manifest")
         manifest = json.loads(run_path.read_text(encoding="utf-8"))
-        expected_method = "exact" if args.join_method == "bernoulli" else "jaccard"
+        expected_method = "exact"
         if (
             manifest.get("status") != "complete"
             or manifest.get("threshold", 1.0) > args.threshold
@@ -275,21 +274,11 @@ def main():
         matrix = sparse.load_npz(args.matrix).tocsr()[train_index][:, feature_ids]
         supports = pack_sparse_detection(matrix, feature_ids, packed)
         del matrix
-        if args.join_method == "bernoulli":
-            manifest = run_join(
-                packed, graph, args.threshold, args.memory_gb, args.output_gb,
-                args.free_disk_gb, args.workers, args.working_memory_gb,
-                min_one_support=1,
-            )
-        else:
-            manifest = run_jaccard_join(
-                packed, graph, args.threshold, workers=args.workers,
-                working_memory_gib=args.working_memory_gb,
-                memory_limit_gib=args.memory_gb,
-                output_limit_gib=args.output_gb,
-                free_disk_reserve_gib=args.free_disk_gb,
-                min_one_support=1,
-            )
+        manifest = run_join(
+            packed, graph, args.threshold, args.memory_gb, args.output_gb,
+            args.free_disk_gb, args.workers, args.working_memory_gb,
+            min_one_support=1,
+        )
     if manifest["status"] != "complete":
         raise RuntimeError(f"exact join stopped: {manifest['status']}: {manifest.get('reason', '')}")
 

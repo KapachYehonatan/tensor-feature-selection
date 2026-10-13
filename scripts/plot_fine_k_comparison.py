@@ -2,7 +2,6 @@
 """Refit cached ranked features at K=1,...,10 and draw fine-grid figures."""
 
 from pathlib import Path
-import os
 import sys
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -14,26 +13,21 @@ from scipy import sparse  # noqa: E402
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score  # noqa: E402
 from sklearn.model_selection import StratifiedShuffleSplit  # noqa: E402
 
-from feature_selection.run_feature_selection import predict_model  # noqa: E402
+from research_utils import predict_model  # noqa: E402
 from scripts.run_method_comparison import (  # noqa: E402
-    HOLDOUT_SEED, MODEL_SEED, output_path, real_jobs, synthetic_jobs,
+    HOLDOUT_SEED, MODEL_SEED, output_path, real_jobs, METHOD_LABELS,
 )
 from scripts.summarize_method_comparison import (  # noqa: E402
-    METHOD_ORDER, METRICS, ROOT, plot_curves, seed_average,
+    METHOD_ORDER, METRICS, ROOT, TABLES, plot_curves,
 )
 
 
 K_VALUES = range(1, 11)
-SOURCE = os.environ.get("FINE_K_SOURCE", "all")
-if SOURCE not in {"all", "real", "synthetic"}:
-    raise ValueError("FINE_K_SOURCE must be all, real, or synthetic")
 
 
 def labels(job):
     source = Path(job["input"])
-    if job["source"] == "real":
-        return pd.read_csv(source / "samples.csv")["y"].to_numpy(dtype=int)
-    return np.load(source / "target.npy").astype(int)
+    return pd.read_csv(source / "samples.csv")["y"].to_numpy(dtype=int)
 
 
 def evaluate_job(job):
@@ -49,7 +43,6 @@ def evaluate_job(job):
         train = sparse.load_npz(method_path / "ranked_train.npz")
         test = sparse.load_npz(method_path / "ranked_test.npz")
         ranking = pd.read_csv(method_path / "ranked_features.csv.gz")
-        coarse = pd.read_csv(method_path / "metrics.csv").iloc[0]
         for requested_k in K_VALUES:
             effective_k = min(requested_k, train.shape[1])
             probability = predict_model(
@@ -60,7 +53,7 @@ def evaluate_job(job):
             rows.append({
                 "source": job["source"], "dataset": job["dataset"], "n": job["n"],
                 "seed": job["seed"], "scenario": job["scenario"],
-                "method": method_path.name, "method_label": coarse["method_label"],
+                "method": method_path.name, "method_label": METHOD_LABELS[method_path.name],
                 "requested_k": requested_k, "effective_k": effective_k,
                 "bacteria_features": int(counts.get("bacterium", 0)),
                 "gene_features": int(counts.get("gene", 0)),
@@ -76,45 +69,27 @@ def evaluate_job(job):
 
 def main():
     rows = []
-    jobs = []
-    if SOURCE in {"all", "real"}:
-        jobs.extend(real_jobs())
-    if SOURCE in {"all", "synthetic"}:
-        jobs.extend(synthetic_jobs())
-    for job in jobs:
+    for job in real_jobs():
         rows.extend(evaluate_job(job))
-        print(f"Completed {job['source']} {job['dataset']} seed={job['seed']}", flush=True)
+        print(f'Fine-K predictions: {job["dataset"]}', flush=True)
     metrics = pd.DataFrame(rows)
-    output_name = "fine_k_metrics.csv" if SOURCE == "all" else f"fine_k_{SOURCE}_metrics.csv"
-    metrics.to_csv(ROOT / output_name, index=False, float_format="%.8g")
-
-    real = metrics[metrics["source"].eq("real")]
-    synthetic_runs = metrics[metrics["source"].eq("synthetic")]
-    synthetic = seed_average(metrics)
-    for dataset, group in real.groupby("dataset"):
-        plot_curves(group, f"Real dataset: {dataset} (K=1,...,10)", f"fine_k_real_{dataset}")
-    for n, group in synthetic_runs.groupby("n"):
-        keys = ["method", "method_label", "requested_k"]
-        plot_curves(
-            group.groupby(keys, as_index=False)[METRICS].mean(),
-            f"Synthetic full_signals: n={int(n)} (K=1,...,10; seed mean ± SD)",
-            f"fine_k_synthetic_n_{int(n)}",
-            group.groupby(keys, as_index=False)[METRICS].std(),
-        )
-    for name, group, title in (
-        ("real", real, "Real datasets: K=1,...,10; mean ± SD"),
-        ("synthetic", synthetic, "Synthetic full_signals: K=1,...,10; mean ± SD"),
-    ):
-        if group.empty:
-            continue
-        keys = ["method", "method_label", "requested_k"]
-        plot_curves(
-            group.groupby(keys, as_index=False)[METRICS].mean(), title,
-            f"fine_k_aggregate_{name}",
-            group.groupby(keys, as_index=False)[METRICS].std(),
-        )
-    print(f"Saved fine-grid metrics and figures under {ROOT}", flush=True)
+    keys = ['dataset', 'method', 'requested_k']
+    expected = {(job['dataset'], method, k) for job in real_jobs() for method in METHOD_ORDER for k in K_VALUES}
+    if (metrics.duplicated(keys).any() or set(map(tuple, metrics[keys].to_numpy())) != expected
+            or not np.isfinite(metrics[METRICS]).all().all()):
+        raise ValueError('Incomplete or duplicate fine-K comparison')
+    metrics.to_csv(ROOT/'fine_k_real_metrics.csv', index=False, float_format='%.8g')
+    TABLES.mkdir(parents=True, exist_ok=True)
+    for dataset, group in metrics.groupby('dataset'):
+        group.to_csv(TABLES/f'fine_k_real_{dataset}.csv', index=False)
+        plot_curves(group, f'{dataset}: 80/20 holdout (K=1,...,10)', f'fine_k_real_{dataset}')
+    grouped = metrics.groupby(['method', 'requested_k'])[METRICS]
+    mean, spread = grouped.mean().reset_index(), grouped.std().reset_index()
+    mean.assign(n_datasets=metrics.dataset.nunique()).to_csv(TABLES/'fine_k_aggregate_real.csv', index=False)
+    plot_curves(mean, 'Real datasets: equal-weight mean ± between-dataset SD (fine K)',
+                'fine_k_aggregate_real', spread)
+    print(f'Saved fine-grid three-method results under {ROOT}', flush=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

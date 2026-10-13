@@ -8,6 +8,7 @@ import sys
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 from scripts import run_cv_evaluation as study
+from research_utils import cache_signature
 import numpy as np
 import pandas as pd
 
@@ -99,9 +100,11 @@ def main():
         native_threads=1, join_workers=study.JOIN_WORKERS, leiden_workers=study.COMMUNITY_WORKERS,
         memory_limit_gib=study.MEMORY_LIMIT_GIB, edge_limit=study.EDGE_LIMIT, no_pilot_refit=True)
     marker = OUTPUT/'extension_protocol.json'
-    if marker.exists() and json.loads(marker.read_text()) != extension:
+    candidate = hashlib.sha256(json.dumps(extension, sort_keys=True).encode()).hexdigest()
+    if marker.exists() and cache_signature(marker, candidate) != hashlib.sha256(
+            json.dumps(json.loads(marker.read_text()), sort_keys=True).encode()).hexdigest():
         raise ValueError('Changed extension inputs; preserve results and use a new output directory')
-    study.write_json(marker, extension)
+    if not marker.exists(): study.write_json(marker, extension)
     original = study.OUTPUT, study.DATASETS, study.THRESHOLDS, study.report
     study.OUTPUT, study.DATASETS, study.THRESHOLDS = OUTPUT, DATASETS, THRESHOLDS
     def report(complete):

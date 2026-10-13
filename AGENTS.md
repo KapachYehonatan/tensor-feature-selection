@@ -32,8 +32,15 @@ request when it conflicts with this file.
 
 ## Scope
 
-- First establish interpretable bacteria, gene, and residual-pair signal.
-- Similarity thresholds determine clusters; do not request a cluster count.
+- The research goal is robust feature selection and statistical multiple testing
+  in ultra-high-dimensional settings, specifically sparse microbiome
+  gene-abundance data with a two-dimensional (bacterium, gene) feature structure.
+- The current comparison uses bacteria-collapsed and gene-collapsed baselines
+  versus our Bernoulli-join method with mean aggregation and MW/BH selection.
+  This is the current experimental setup, not a permanent restriction on methods
+  or statistical tests.
+- In the current Bernoulli-join method, similarity thresholds determine clusters;
+  do not request a cluster count.
 - Leave weakly similar features as singletons.
 - Do not add factorization, random projection, approximate-neighbor, workflow,
   or distributed-computing dependencies until simple experiments justify them.

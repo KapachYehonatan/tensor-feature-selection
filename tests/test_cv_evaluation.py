@@ -39,7 +39,7 @@ class CVTests(unittest.TestCase):
             with self.assertRaises(ValueError): study.verify_split(path, np.arange(9), np.arange(9, 20), ids, cutoff)
 
     def test_validation_labels_cannot_change_rankings_or_training_scaling(self):
-        from feature_selection.run_feature_selection import new_model
+        from research_utils import new_model
         y = np.repeat([0, 1], 15)
         values = np.column_stack((np.ones(30), 1+10*y, np.linspace(.1, 1, 30)))
         x = sparse.csr_matrix(values)
