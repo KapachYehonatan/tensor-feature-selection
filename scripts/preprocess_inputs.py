@@ -22,16 +22,14 @@ SOURCE_DATASET = SOURCE_DATASETS.get(DATASET, DATASET)
 TARGET_COLUMN = "disease"
 NEGATIVE_LABEL = "healthy"
 POSITIVE_LABEL = os.environ.get("POSITIVE_LABEL", "CRC")
-PREVALENCE_FRACTION = 0.05
-MINIMUM_SAMPLES = 5
-OUTPUT = PROJECT / "outputs/preprocessing" / DATASET
+OUTPUT = PROJECT / "outputs/.cache/inputs" / DATASET
 
 sys.path.insert(0, str(PROJECT))
-from research_utils import (  # noqa: E402
-    prevalence_mask,
+from methods.preprocessing import (  # noqa: E402
     unique_day_zero_stool_mask,
-    write_lines,
 )
+
+from experiments.cache import write_lines
 
 
 def parse_pair_names(path):
@@ -98,9 +96,6 @@ def align_metadata(path, sample_ids):
     return selected.reset_index(drop=True), keep
 
 
-if not 0 < PREVALENCE_FRACTION <= 1:
-    raise ValueError("PREVALENCE_FRACTION must be in (0, 1]")
-
 study = SOURCE_ROOT / SOURCE_DATASET
 matrix_path = study / f"{SOURCE_DATASET}_gene_families.mtx"
 feature_path = study / f"{SOURCE_DATASET}_genes.txt"
@@ -125,10 +120,10 @@ elif raw.shape[0] == len(sample_ids):
 else:
     raise ValueError(f"Neither matrix dimension matches {len(sample_ids)} samples")
 del raw
-matrix = matrix[labeled_rows][:, valid].astype(np.float32)
+matrix = matrix[labeled_rows][:, valid]
 matrix.eliminate_zeros()
-if matrix.data.size and matrix.data.min() < 0:
-    raise ValueError("Expected nonnegative abundances")
+if not np.isfinite(matrix.data).all() or np.any(matrix.data < 0):
+    raise ValueError("Expected finite nonnegative feature values")
 
 # Remove pair columns absent from every labeled sample.
 observed = np.asarray(matrix.getnnz(axis=0)).ravel() > 0
@@ -141,25 +136,13 @@ if len(empty):
         f"{samples.iloc[empty]['sample_id'].tolist()[:10]}"
     )
 
-# Step 3: report the whole-data filter only as an audit preview. Evaluation
-# recomputes this mask from each training fold to prevent leakage.
-mask, support, threshold = prevalence_mask(
-    matrix,
-    PREVALENCE_FRACTION,
-    MINIMUM_SAMPLES,
-)
-total_mass = float(matrix.sum())
-retained_mass = float(matrix[:, mask].sum())
-
-# Step 4: save the one necessary sparse cache and compact mappings.
+# Step 3: save supplied values and mappings; prevalence filtering is training-local.
 OUTPUT.mkdir(parents=True, exist_ok=True)
 sparse.save_npz(OUTPUT / "X_valid.npz", matrix, compressed=True)
 np.savez_compressed(
     OUTPUT / "edges.npz",
     pair_gene=pair_gene,
     pair_bacteria=pair_bacteria,
-    global_support=support,
-    global_mask=mask,
 )
 sample_columns = ["sample_id", TARGET_COLUMN, "y"]
 if DATASET in SOURCE_DATASETS:
@@ -181,9 +164,6 @@ pd.DataFrame(
         "negative": int((samples["y"] == 0).sum()),
         "positive": int((samples["y"] == 1).sum()),
         "valid_pairs": matrix.shape[1],
-        "retained_pairs_preview": int(mask.sum()),
-        "minimum_sample_support": threshold,
-        "retained_mass_fraction": retained_mass / total_mass,
         "genes": len(genes),
         "bacteria": len(bacteria),
         "source_matrix": str(matrix_path),
@@ -194,8 +174,5 @@ print(
     f"Samples: {matrix.shape[0]}; negative: {(samples['y'] == 0).sum()}; "
     f"positive: {(samples['y'] == 1).sum()}"
 )
-print(
-    f"Valid pairs: {matrix.shape[1]:,}; preview retained: {mask.sum():,}; "
-    f"sample threshold: {threshold}; retained mass: {retained_mass / total_mass:.3f}"
-)
+print(f"Valid pairs: {matrix.shape[1]:,}; genes: {len(genes):,}; bacteria: {len(bacteria):,}")
 print(f"Saved prepared data to {OUTPUT}")

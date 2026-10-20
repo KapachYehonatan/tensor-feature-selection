@@ -314,6 +314,7 @@ def main():
             f"(hard={args.community_max_edges:,}, memory={memory_edge_budget:,})",
             flush=True,
         )
+    resource_retries = []
     while True:
         try:
             community = run_community_detection(
@@ -338,6 +339,8 @@ def main():
                 counts = count_threshold_edges(
                     graph, thresholds, manifest, iter_edge_shards
                 )
+            resource_retries.append(dict(from_threshold=effective_threshold,
+                to_threshold=remaining[0], reason=f'{type(error).__name__}: {error}'))
             effective_threshold = remaining[0]
             community_graph = args.output / f"graph-threshold-{effective_threshold:.2f}"
             filter_exact_graph(
@@ -405,6 +408,7 @@ def main():
         "community_memory_edge_budget": memory_edge_budget,
         "community_hard_edge_cap": args.community_max_edges,
         "fixed_threshold": args.fixed_threshold,
+        "resource_retries": resource_retries,
         "community_safety_fraction": COMMUNITY_SAFETY_FRACTION,
         "features": int(len(feature_ids)), "clusters": int(len(sizes)),
         "singleton_clusters": int(np.sum(sizes == 1)),

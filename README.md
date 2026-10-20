@@ -1,86 +1,79 @@
 # Robust feature selection in ultra-high-dimensional microbiome data
 
-This research project aims to develop robust feature-selection and statistical
-multiple-testing methods for ultra-high-dimensional settings. We study sparse
-microbiome gene-abundance data, whose features have a two-dimensional
-**(bacterium, gene)** structure.
+This project studies feature selection and statistical multiple testing for sparse
+microbiome gene abundances with a **(bacterium, gene)** structure. The current
+comparison includes bacteria-collapsed, gene-collapsed, Bernoulli-join mean, SHOE,
+MW → e-BH, Hurdle-product → e-BH, and Hurdle-average → e-BH. These are the current
+methods, not a permanent restriction on the research.
 
-Our current method is **Bernoulli-join**, using mean aggregation. We currently
-compare it with the **bacteria-collapsed** and **gene-collapsed** baselines across
-eight independent-sample cohorts. These experiments use Mann–Whitney tests with
-Benjamini–Hochberg correction (MW/BH); this setup does not limit future methods
-or multiple-testing approaches.
+## Code
 
-## Current experimental pipeline
+- `methods/preprocessing.py` and `representations.py`: input validation,
+  training-local filtering, raw pairs, and group means.
+- `methods/graphs/`: adaptive Bernoulli graph preparation and exact join/Leiden worker.
+- `methods/selectors/`: MW/BH/BY, SHOE, and MW/Hurdle e-value selectors.
+- `metrics/`: prediction metrics and complete-set pairwise absolute correlation.
+- `shuffled_fdp_test/`: shuffled discovery counts and the count-comparison p-value.
+- `experiments/`: CV/full-dataset scientific flows and strict cache validation.
+- `scripts/`: input export, sequential execution, resource launcher, and plotting.
+- `tests/test_experiment.py`: small scientific and cache-integrity fixtures.
+- `docs/`: method theory notes.
 
-The three current methods learn prevalence filtering from training samples,
-normalize retained pair abundances per sample, average the original pair
-abundances, and take the square root once. MW/BH screens each complete feature
-family at q≤0.10; ranking
-is q, p, then feature ID. Prediction uses training-only scaling and balanced L2
-logistic regression, C=1. Fine K is 1–10; coarse K is 5,10,20,35,50,60,75,85,100.
-No K tuning is performed in the five-fold CV study.
+## Scientific protocol
 
-## Data and environments
+Keep finite nonnegative sparse values as supplied: no sample normalization, log,
+or square-root transformation. Learn prevalence support ≥ max(5,ceil(.05*n)) and
+constant exclusion locally. Representations average retained pair values with
+fixed training-defined denominators; raw-pair selectors do not aggregate.
 
-The project `.venv` uses `requirements.txt`. Exact graph construction and
-Leiden use the existing environment in the sibling `bernoulli-correlation-join`
-repository. Do not delete or modify that repository or the read-only source
-data in `/home/kapachy/Microbium/projects/cMD_downloads`.
+Prediction uses identical seed-42 five-fold splits, K=1–10 and {10,20,50,75},
+without tuning. Use training-fitted `StandardScaler(with_mean=False)` and balanced
+L2 logistic regression C=1. Keep mean-fold/SD and pooled OOF metrics distinct.
+Top-K prediction rankings are not FDR-controlled discovery sets.
 
-`preprocessing/run_preprocessing.py` creates sparse pair-abundance caches and
-independent-sample metadata under `outputs/preprocessing`. Configure DATASET
-and POSITIVE_LABEL in its environment. HMP and Nielsen use one day-zero stool
-sample per participant. Whole-cohort prevalence masks in these caches are
-audit previews only: every evaluation split relearns its own mask.
+Full-dataset findings use all samples separately from CV. Baselines define BH/BY
+discoveries at alpha=.10; the four e-value methods use native e-BH. SHOE alone
+uses an honest internal 50/50 score/evidence split. Average pairwise absolute
+correlation uses complete discovery sets: undefined below two features and
+skipped above 10,000, without sampling. The Shuffled FDP test compares real
+discoveries with 100 paired class-preserving label shuffles; its p-value requires
+the binomial/normal approximation and is not an FDR certificate. Findings remain
+exploratory. No separate shuffled-test diagnostics or report are generated.
 
-## Original 80/20 comparison
+Graphs start at absolute phi .70 and adapt upward by .05 only for resource
+guards. Keep the 500-million-edge limit and ordinary weighted-modularity Leiden
+convergence, resolution 1 and seed 17729. Source data under
+`/home/kapachy/Microbium/projects/cMD_downloads` and the sibling Bernoulli-join
+repository/environment remain untouched.
 
-`scripts/run_method_comparison.py` runs all three methods on the deterministic
-seed-42 80/20 split. Dataset selection and scientific settings are constants
-near the top of the scripts. Existing valid results and Bernoulli graphs are
-reused. The historical join requested absolute phi .70; its resource-dependent
-effective threshold is recorded per dataset. This behavior is unchanged.
+## Usage and outputs
 
-`scripts/summarize_method_comparison.py` regenerates coarse tables/figures from
-completed method outputs. `scripts/plot_fine_k_comparison.py` performs only
-cached-predictor fits for fine K. Results remain in `outputs/method_comparison`.
+Regenerate the eight public figures, without scientific fitting:
 
-## Five-fold evaluation
+```bash
+.venv/bin/python scripts/plot_comparison.py
+```
 
-`scripts/run_cv_evaluation.py` covers HMP/QinJ; its remaining-datasets companion
-covers the other six cohorts. Every fold rebuilds its own filtering, exact
-graph, Leiden communities, aggregation, MW/BH and prediction model. No
-historical assignments enter these folds. Fixed absolute-phi thresholds are
-HMP/Nielsen/Rubel .70, ZhuF .75, and QinJ/JieZ/LiJ/Wirbel .80.
+`outputs/` contains four `AUC_average_k_…` / `AUC_overview_k_…` figures and the
+pairwise-correlation, −log10(p-value), and real-discovery overviews. Supporting
+inputs/results are private under `outputs/.cache/`: `inputs`, `cv`,
+`full_dataset`, `shuffled_fdp_test`, `plot_data`, and `provenance`.
+The additional `average_pairwise_absolute_correlation_k_10_20_50_75.png` shows
+full-dataset correlations of unscreened score-ranked Top-K features for all seven
+methods, not significance-filtered subsets or CV-fold averages.
 
-Launch the corresponding `launch_cv_evaluation*.py` supervisor with `nohup`
-and log redirection inside a persistent user service with `MemoryMax=200G`
-and `MemorySwapMax=0`. The supervisor writes PID and resource records in
-`logs`. CV uses one native thread, four join workers and one Leiden worker.
-The 500-million-edge guard never silently raises CV thresholds.
+For a scientific run/resumption, use `scripts/launch_experiment.py` under `nohup`
+inside a persistent user service with `MemoryMax=200G` and `MemorySwapMax=0`.
+The supervisor writes logs/PIDs under `logs/`; use one numerical thread, four
+join workers, and one Leiden worker. HMP and QinJ run first. Completed compatible
+caches resume without scientific refitting; incompatible inputs/settings/code
+fail rather than overwriting results. Plotting, tests, and documentation are not
+part of scientific fingerprints.
 
-Preserved fold outputs live in `outputs/cv_evaluation`, with combined
-non-copying dataset views in its `all_real` directory. Seven datasets have
-five completed folds. ZhuF remains incomplete: its first fold required
-518,029,089 edges, exceeding the graph guard. Cleanup does not resolve it.
+```bash
+OPENBLAS_NUM_THREADS=1 .venv/bin/python -m unittest discover -s tests
+```
 
-Primary results are mean fold metrics with descriptive fold SD, not confidence
-intervals. Pooled OOF metrics are reported separately. Peaks over K are
-descriptive, and these previously explored datasets remain exploratory.
-
-`scripts/plot_cv_vs_holdout.py` draws cached fine/coarse AUROC panels: solid CV
-means and same-color dotted 80/20 curves, with a uniform zoomed y-scale.
-Its PNGs are in `outputs/cv_evaluation/all_real/figures`.
-
-## Checks and cache provenance
-
-Run `.venv/bin/python -m unittest discover -s tests`.
-Shared scientific calculations are in `research_utils.py`.
-
-The cleanup manifest and verification records use `logs/project_cleanup*`.
-Original scientific protocol records remain untouched. An explicit compatibility
-record permits only verified historical signatures under unchanged inputs,
-cache artifacts and refactored scientific code; incompatible changes still fail.
-Obsolete experiments were permanently removed without an archive. Git can
-recover tracked code, but not deleted untracked results.
+Original protocols and the exact cleanup/compatibility records are retained
+privately in `outputs/.cache/provenance/`. Superseded runs are permanently
+deleted; the reorganization itself does not rerun any real experiment.

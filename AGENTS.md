@@ -14,6 +14,21 @@ request when it conflicts with this file.
 - A little repetition is preferable to an abstraction that hides the analysis.
 - Keep comments at scientific section boundaries and explain leakage risks.
 
+## Output scope and project organization
+
+- Always ask what results and exact outputs the user expects before implementing
+  or running an experiment or analysis. Use explicitly requested deliverables as
+  the agreed scope; clarify missing details instead of inventing extra outputs.
+- Generate only agreed plots, tables, and reports. Do not add unsolicited
+  diagnostics, duplicate summaries, or speculative exports. Keep only necessary
+  supporting data and caches privately under `outputs/.cache/`.
+- Inspect the existing project directory and hierarchy before adding code or
+  artifacts. Reuse the appropriate existing modules and locations; keep code
+  out of `outputs/` and keep public outputs limited to requested deliverables.
+- When a task raises a project-design or hierarchy decision, ask the user for
+  their preferred design or propose a concise recommended change and obtain
+  agreement before implementing it. Do not silently introduce new structures.
+
 ## Data and outputs
 
 - Treat `/home/kapachy/Microbium/projects/cMD_downloads` as read-only.
@@ -23,6 +38,8 @@ request when it conflicts with this file.
   attached only to an interactive tool session.
 - Prevalence filtering, clustering, scaling, and feature selection used for
   evaluation must be learned from training samples only.
+- Preserve supplied nonnegative sparse values: no sample normalization or
+  abundance transformation. Scaling belongs only inside the classifier.
 - Analyze only datasets with one independent sample per participant.
 - Read and save sparse matrices; never create the dense tensor or a complete
   gene-gene similarity matrix.
@@ -35,10 +52,11 @@ request when it conflicts with this file.
 - The research goal is robust feature selection and statistical multiple testing
   in ultra-high-dimensional settings, specifically sparse microbiome
   gene-abundance data with a two-dimensional (bacterium, gene) feature structure.
-- The current comparison uses bacteria-collapsed and gene-collapsed baselines
-  versus our Bernoulli-join method with mean aggregation and MW/BH selection.
-  This is the current experimental setup, not a permanent restriction on methods
-  or statistical tests.
+- The current experiment compares bacteria-collapsed, gene-collapsed and
+  Bernoulli-join means with raw-pair SHOE, MW-eBH and Hurdle product/average
+  selectors. Prediction uses CV; statistical findings use all samples. Baseline
+  prediction is unscreened MW ranking; BH/BY define statistical subsets. This
+  setup is not a permanent restriction on methods or statistical tests.
 - In the current Bernoulli-join method, similarity thresholds determine clusters;
   do not request a cluster count.
 - Leave weakly similar features as singletons.

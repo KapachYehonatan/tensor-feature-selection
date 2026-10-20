@@ -15,11 +15,11 @@ import time
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
-PREFIX = 'cv_evaluation'
+PREFIX = 'experiment'
 LIMIT_BYTES = 200*1024**3
 SAMPLE_SECONDS = 5
-RUNNER = PROJECT/'scripts/run_cv_evaluation.py'
-STUDY_OUTPUT = PROJECT/'outputs/cv_evaluation'
+RUNNER = PROJECT/'scripts/run_experiment.py'
+STUDY_OUTPUT = PROJECT/'outputs/.cache/provenance/run'
 
 
 def process_tree(root):
@@ -76,7 +76,7 @@ def main():
             cwd=PROJECT, env=env, start_new_session=True)
         (logs/f'{PREFIX}.pid').write_text(str(child.pid)+'\n')
         (logs/f'{PREFIX}.supervisor.pid').write_text(str(os.getpid())+'\n')
-        print(f'CV evaluation PID={child.pid}; supervisor={os.getpid()}; hard memory ceiling=200 GiB', flush=True)
+        print(f'{PREFIX} PID={child.pid}; supervisor={os.getpid()}; hard memory ceiling=200 GiB', flush=True)
         def stop(signum, frame):
             if child.poll() is None: os.killpg(child.pid, signal.SIGTERM)
         signal.signal(signal.SIGTERM, stop)
@@ -121,8 +121,11 @@ def main():
                 rows.loc[running, 'error'] = f'Interrupted process exit {child.returncode}; see logs/{PREFIX}.exit.json'
                 rows.to_csv(status, index=False)
             result = STUDY_OUTPUT/'result.json'
-            if not result.exists(): result.write_text(json.dumps(dict(status='interrupted', resource_summary=summary), indent=2))
-        print('CV evaluation exit: '+json.dumps(summary), flush=True)
+            saved = json.loads(result.read_text()) if result.exists() else {}
+            if saved.get('status', 'running') == 'running':
+                saved.update(status='interrupted', resource_summary=summary)
+                result.write_text(json.dumps(saved, indent=2))
+        print(PREFIX+' exit: '+json.dumps(summary), flush=True)
         sys.exit(child.returncode if child.returncode >= 0 else 128-child.returncode)
 
 
