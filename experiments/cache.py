@@ -19,6 +19,7 @@ FULL = CACHE/'full_dataset/baselines'
 NATIVE_CV = CACHE/'cv/native'
 NATIVE_FULL = CACHE/'full_dataset/native'
 PROVENANCE = CACHE/'provenance'
+SHUFFLED = CACHE/'shuffled_fdp_test/permutation_v1'
 JOIN_PYTHON = Path('/home/kapachy/Microbium/bernoulli-correlation-join/.venv/bin/python')
 DATASETS = ['HMP_2019_ibdmdb_unique', 'QinJ_2012', 'JieZ_2017', 'LiJ_2017',
             'NielsenHB_2014_unique', 'RubelMA_2020', 'WirbelJ_2018', 'ZhuF_2020']
@@ -30,6 +31,7 @@ METHODS = {'bacteria': 'Bacteria-collapsed', 'gene': 'Gene-collapsed', 'join': '
 NATIVE = list(METHODS)[3:]
 METRICS = ['auroc', 'precision', 'recall', 'f1']
 SEED = 42
+SHUFFLE_COUNT = 999
 
 
 def read_lines(path):
@@ -50,6 +52,16 @@ def file_hash(path):
     with Path(path).open('rb') as handle:
         for block in iter(lambda: handle.read(1024*1024), b''): digest.update(block)
     return digest.hexdigest()
+
+
+def validate_fingerprints(expected):
+    """Only the explicitly audited statistic-only source replacements may differ."""
+    path=PROVENANCE/'permutation_p_compatibility.json'
+    replacements=json.loads(path.read_text())['code_replacements'] if path.exists() else {}
+    for name,digest in expected.items():
+        actual=file_hash(PROJECT/name)
+        if actual != digest and replacements.get(name) != dict(before=digest,after=actual):
+            raise ValueError(f'Changed scientific input/code: {name}')
 
 
 def write_json(path, value):
@@ -90,7 +102,7 @@ def build_protocol(stage):
     protocol = dict(version='organized_supplied_values_v1', stage=stage, datasets=DATASETS,
         methods=METHODS, folds=5, seed=SEED, k_values=K_VALUES, alpha=.10,
         sample_normalization='none', abundance_transform='none', aggregation='mean supplied values',
-        prevalence=[.05, 5], permutations=100, permutation_key='dataset/full_data',
+        prevalence=[.05, 5], permutations=SHUFFLE_COUNT, permutation_key='dataset/full_data',
         graph=dict(threshold=.70, adaptive_step=.05, edge_limit=500_000_000,
                    resolution=1., seed=17729, iterations=-1, objective='modularity',
                    workers=4, community_workers=1, memory_gib=200),
@@ -114,8 +126,29 @@ def open_protocol(directory, stage):
     directory.mkdir(parents=True, exist_ok=True)
     path = directory/'protocol.json'
     if path.exists():
-        if json.loads(path.read_text()) != protocol:
-            raise ValueError(f'Changed inputs/settings/scientific code: {path}; do not overwrite these results')
+        stored=json.loads(path.read_text())
+        if stored != protocol:
+            record=PROVENANCE/'permutation_p_compatibility.json'
+            key=str(path.relative_to(PROJECT)) if path.is_relative_to(PROJECT) else ''
+            approved=json.loads(record.read_text()) if record.exists() else {}
+            entry=approved.get('protocols',{}).get(key)
+            compatible=dict(protocol,signature=stored['signature'],code_sha256=stored.get('code_sha256'))
+            for name,change in approved.get('settings_replacements',{}).items():
+                if stored.get(name)==change['before'] and protocol.get(name)==change['after']:
+                    compatible[name]=stored[name]
+            if (not entry or entry != dict(sha256=file_hash(path),signature=stored['signature']) or
+                    compatible != stored or set(protocol['code_sha256']) != set(stored['code_sha256'])):
+                raise ValueError(f'Changed inputs/settings/scientific code: {path}; do not overwrite these results')
+            validate_fingerprints(stored['code_sha256'])
+            # Historical signatures are read-only: never resume missing scientific work under them.
+            roots={'cv_baselines':[(CV,True)],'full_baselines':[(FULL,False)],
+                   'native':[(NATIVE_CV,True),(NATIVE_FULL,False)]}[stage]
+            for root,folds in roots:
+                for dataset in DATASETS:
+                    markers=[root/dataset/f'fold_{f}/complete.json' for f in range(5)] if folds else [root/dataset/'complete.json']
+                    if any(not complete(marker,stored['signature']) for marker in markers):
+                        raise ValueError('Statistic-only compatibility requires completed historical caches')
+            return stored['signature']
     else:
         if any(directory.iterdir()): raise ValueError(f'Nonempty cache has no validated protocol: {directory}')
         write_json(path, protocol)
@@ -131,7 +164,6 @@ def relocated_signature(directory, candidate):
         key=str(path.relative_to(PROJECT)) if path.is_relative_to(PROJECT) else ''
         entry=saved['internal_signatures'].get(key)
         if entry and entry['new_signature']==candidate:
-            for name, digest in saved['scientific_code_sha256'].items():
-                if file_hash(PROJECT/name) != digest: raise ValueError('Changed code for relocated checkpoint')
+            validate_fingerprints(saved['scientific_code_sha256'])
             return entry['old_signature']
     return candidate

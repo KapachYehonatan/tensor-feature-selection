@@ -14,7 +14,8 @@ from scripts.plot_comparison import main as plot
 
 def main():
     progress=dict(cv='pending',full_dataset='pending',plots='pending')
-    for name,run in [('cv',cross_validation.main),('full_dataset',full_dataset.main),('plots',plot)]:
+    for name,run in [('cv',cross_validation.main),('full_dataset',full_dataset.main),
+                     ('shuffled_test',full_dataset.run_shuffled_test),('plots',plot)]:
         progress[name]='running'; write_json(PROVENANCE/'run/status.json',progress)
         try: run()
         except BaseException:
