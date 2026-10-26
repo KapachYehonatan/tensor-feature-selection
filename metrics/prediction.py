@@ -29,42 +29,18 @@ def predict_model(train_x, train_y, test_x, model_seed=MODEL_SEED):
     return model.predict_proba(test_x)[:, 1]
 
 
-def evaluate(train, test, ytrain, ytest, ks, c=1):
-    rows, predictions, cache = [], [], {}
+def predict_prefixes(train, test, ytrain, ytest, ks):
+    """Fit each distinct prefix once; metrics are calculated from saved probabilities."""
+    predictions, cache = [], {}
     for k in ks:
         effective = min(k, train.shape[1])
         if effective not in cache:
-            probability = np.full(len(ytest), ytrain.mean())
-            if effective:
-                model = new_model(SEED)
-                model.set_params(logisticregression__C=c)
-                model.fit(train[:, :effective], ytrain)
-                probability = model.predict_proba(test[:, :effective])[:, 1]
+            probability = predict_model(train[:, :effective], ytrain, test[:, :effective])
             cache[effective] = probability
         probability = cache[effective]
-        predicted = probability >= .5
-        rows.append(dict(requested_k=k, effective_k=effective,
-                         auroc=roc_auc_score(ytest, probability),
-                         precision=precision_score(ytest, predicted, zero_division=0),
-                         recall=recall_score(ytest, predicted, zero_division=0),
-                         f1=f1_score(ytest, predicted, zero_division=0)))
         predictions.extend(dict(requested_k=k, test_position=i, y=int(ytest[i]),
                                 probability=float(value)) for i, value in enumerate(probability))
-    return pd.DataFrame(rows), pd.DataFrame(predictions)
-
-
-
-def prediction_metrics(predictions):
-    rows = []
-    for (method, k), group in predictions.groupby(['method', 'requested_k']):
-        if not np.isfinite(group.probability).all() or not group.probability.between(0, 1).all():
-            raise ValueError('Invalid out-of-fold probabilities')
-        y, probability = group.y.to_numpy(), group.probability.to_numpy()
-        predicted = probability >= .5
-        rows.append(dict(method=method, requested_k=k, auroc=roc_auc_score(y, probability),
-            precision=precision_score(y, predicted, zero_division=0), recall=recall_score(y, predicted, zero_division=0),
-            f1=f1_score(y, predicted, zero_division=0)))
-    return pd.DataFrame(rows).sort_values(['method', 'requested_k']).reset_index(drop=True)
+    return pd.DataFrame(predictions)
 
 
 
@@ -72,4 +48,34 @@ def point_metrics(y, probability):
     prediction = probability >= .5
     return dict(auroc=roc_auc_score(y, probability), precision=precision_score(y, prediction, zero_division=0),
         recall=recall_score(y, prediction, zero_division=0), f1=f1_score(y, prediction, zero_division=0))
+
+
+def summarize(folds, predictions, evaluation):
+    """Incomplete CV pairs never enter mean-fold or pooled OOF comparisons."""
+    columns = ['dataset', 'method', 'requested_k', 'auroc_cv_mean', 'auroc_fold_sd',
+               'precision_cv_mean', 'recall_cv_mean', 'f1_cv_mean', 'auroc_pooled_oof',
+               'precision_pooled_oof', 'recall_pooled_oof', 'f1_pooled_oof', 'effective_k_min', 'effective_k_max']
+    rows = []
+    for (dataset, method), group in folds.groupby(['dataset', 'method']):
+        expected = {(f, k) for f in range(evaluation.folds) for k in evaluation.k}
+        if group.duplicated(['fold', 'requested_k']).any():
+            raise ValueError('Duplicate fold/K metrics')
+        if set(map(tuple, group[['fold', 'requested_k']].to_numpy())) != expected:
+            continue
+        pred = predictions[predictions.dataset.eq(dataset) & predictions.method.eq(method)]
+        n = int(group.participants.iloc[0])
+        if not group.participants.eq(n).all():
+            raise ValueError('Changed participant count')
+        for k in evaluation.k:
+            selected = pred[pred.requested_k.eq(k)].sort_values('sample_index')
+            if not np.array_equal(selected.sample_index.to_numpy(), np.arange(n)):
+                raise ValueError('Incomplete once-only OOF coverage')
+            fold = group[group.requested_k.eq(k)]
+            pooled = point_metrics(selected.y.to_numpy(), selected.probability.to_numpy())
+            row = dict(dataset=dataset, method=method, requested_k=k, auroc_fold_sd=fold.auroc.std(),
+                       effective_k_min=fold.effective_k.min(), effective_k_max=fold.effective_k.max())
+            row.update({name+'_cv_mean': float(fold[name].mean()) for name in pooled})
+            row.update({name+'_pooled_oof': value for name, value in pooled.items()})
+            rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
 

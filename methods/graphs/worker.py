@@ -88,15 +88,15 @@ def stable_cluster_labels(feature_ids, labels, supports, n):
     return np.asarray([mapping[value] for value in labels], dtype=np.int64)
 
 
-def fallback_thresholds(start):
+def fallback_thresholds(start, step=FALLBACK_STEP):
     """Return deterministic thresholds from the requested value through one."""
     values = [round(float(start), 2)]
-    candidate = np.ceil((float(start) + 1e-12) / FALLBACK_STEP) * FALLBACK_STEP
+    candidate = np.ceil((float(start) + 1e-12) / step) * step
     while candidate <= 1.0 + 1e-12:
         rounded = round(float(candidate), 2)
         if rounded > values[-1]:
             values.append(rounded)
-        candidate += FALLBACK_STEP
+        candidate += step
     return values
 
 
@@ -193,62 +193,10 @@ def filter_exact_graph(source, destination, threshold, edge_count, manifest,
     return filtered
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("matrix", type=Path)
-    parser.add_argument("split", type=Path)
-    parser.add_argument("output", type=Path)
-    parser.add_argument("--threshold", type=float, default=0.7)
-    parser.add_argument(
-        "--join-method", choices=("bernoulli",), default="bernoulli"
-    )
-    parser.add_argument("--workers", type=int, default=36)
-    parser.add_argument("--community-workers", type=int, default=None,
-                        help="Leiden workers; defaults to --workers for existing callers")
-    parser.add_argument("--memory-gb", type=float, default=125.0)
-    parser.add_argument("--working-memory-gb", type=float, default=40.0)
-    parser.add_argument("--community-working-memory-gb", type=float, default=125.0)
-    parser.add_argument("--output-gb", type=float, default=40.0)
-    parser.add_argument("--free-disk-gb", type=float, default=500.0)
-    parser.add_argument("--memory-reserve-gb", type=float, default=64.0)
-    parser.add_argument("--keep-graph-gb", type=float, default=20.0)
-    parser.add_argument("--community-max-edges", type=int, default=MAX_COMMUNITY_EDGES)
-    parser.add_argument("--fixed-threshold", action="store_true",
-                        help="Fail on resource limits instead of increasing the requested threshold")
-    args = parser.parse_args()
-    if args.community_max_edges < 1:
-        raise ValueError("community edge cap must be positive")
-    community_workers = args.workers if args.community_workers is None else args.community_workers
-    if args.workers < 1 or community_workers < 1:
-        raise ValueError("join and community workers must be positive")
-
-    required = args.memory_gb + args.memory_reserve_gb
-    available = available_memory_gib()
-    if available < required:
-        raise RuntimeError(
-            f"need at least {required:.1f} GiB available before starting; "
-            f"found {available:.1f} GiB"
-        )
-    free_disk = shutil.disk_usage(args.output.parent).free / GIB
-    if free_disk < args.free_disk_gb:
-        raise RuntimeError(
-            f"need at least {args.free_disk_gb:.1f} GiB free before starting; "
-            f"found {free_disk:.1f} GiB"
-        )
+def build_graph(args, train_index, feature_ids):
+    """Build/reuse only the exact source graph; never run Leiden."""
     sys.path.insert(0, str(JOIN_PROJECT))
-    from bernoulli_join import (
-        directory_bytes, iter_edge_shards, load_packed_dataset, packed_supports,
-        ResourceLimit, run_join,
-    )
-    from community_detection import (
-        PART_DTYPE, WORKSPACE_MULTIPLIER, run_community_detection,
-    )
-
-    with np.load(args.split) as split:
-        train_index = split["train_index"]
-        feature_ids = split["feature_ids"]
-    if not len(feature_ids):
-        raise RuntimeError("prevalence filtering retained no pair features")
+    from bernoulli_join import run_join, load_packed_dataset, packed_supports
     packed, graph = args.output / "packed", args.output / "graph"
     run_path = graph / "run.json"
     if args.output.exists():
@@ -282,7 +230,23 @@ def main():
     if manifest["status"] != "complete":
         raise RuntimeError(f"exact join stopped: {manifest['status']}: {manifest.get('reason', '')}")
 
-    thresholds = [args.threshold] if args.fixed_threshold else fallback_thresholds(args.threshold)
+    return manifest, supports
+
+
+def cluster_graph(args, train_index, feature_ids):
+    """Partition saved edges with partition-owned output and explicit settings."""
+    sys.path.insert(0, str(JOIN_PROJECT))
+    from bernoulli_join import directory_bytes, iter_edge_shards, load_packed_dataset, packed_supports, ResourceLimit
+    from community_detection import PART_DTYPE, WORKSPACE_MULTIPLIER, run_community_detection
+    args.output.mkdir(parents=True, exist_ok=True)
+    community_workers = args.community_workers
+    graph = args.graph_source / "graph"
+    manifest = json.loads((graph / "run.json").read_text())
+    bits, packed_ids, metadata = load_packed_dataset(args.graph_source / "packed")
+    if int(metadata["n"]) != len(train_index) or not np.array_equal(packed_ids, feature_ids):
+        raise ValueError("Saved graph and requested fitting indices do not match")
+    supports = packed_supports(bits)
+    thresholds = [args.threshold] if args.fixed_threshold else fallback_thresholds(args.threshold, args.threshold_step)
     memory_edge_budget = int(
         COMMUNITY_SAFETY_FRACTION * args.community_working_memory_gb * GIB
         / (PART_DTYPE.itemsize * WORKSPACE_MULTIPLIER)
@@ -318,10 +282,11 @@ def main():
     while True:
         try:
             community = run_community_detection(
-                community_graph, seed=17_729, resolution=1.0,
+                community_graph, seed=args.seed, resolution=args.resolution,
                 memory_limit_gib=args.memory_gb, output_limit_gib=args.output_gb,
                 free_disk_reserve_gib=args.free_disk_gb, workers=community_workers,
                 working_memory_gib=args.community_working_memory_gb,
+                output_dir=args.output / 'community', leiden_iterations=args.iterations,
             )
             break
         except (MemoryError, ResourceLimit, RuntimeError) as error:
@@ -358,7 +323,7 @@ def main():
 
     row_ids = np.empty(len(feature_ids), dtype=np.uint32)
     graph_labels = np.empty(len(feature_ids), dtype=np.int64)
-    with gzip.open(community_graph / "clusters.csv.gz", "rt", encoding="utf-8") as handle:
+    with gzip.open(args.output / "community/clusters.csv.gz", "rt", encoding="utf-8") as handle:
         rows = csv.DictReader(handle)
         count = 0
         for count, row in enumerate(rows, start=1):
@@ -395,10 +360,7 @@ def main():
         writer.writerows((cluster, int(size)) for cluster, size in enumerate(sizes))
 
     graph_gib = directory_bytes(args.output) / GIB
-    edges_pruned = graph_gib > args.keep_graph_gb
-    if edges_pruned:
-        for edge_directory in args.output.glob("graph*/edges"):
-            shutil.rmtree(edge_directory)
+    edges_pruned = False
     summary = {
         "status": "complete", "join_method": args.join_method,
         "requested_threshold": args.threshold,
@@ -420,6 +382,52 @@ def main():
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("matrix", type=Path)
+    parser.add_argument("split", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--mode", choices=("graph", "cluster"), required=True)
+    parser.add_argument("--graph-source", type=Path)
+    parser.add_argument("--threshold", type=float, default=.70)
+    parser.add_argument("--threshold-step", type=float, default=.05)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--community-workers", type=int, default=1)
+    parser.add_argument("--memory-gb", type=float, default=125.)
+    parser.add_argument("--working-memory-gb", type=float, default=24.)
+    parser.add_argument("--community-working-memory-gb", type=float, default=125.)
+    parser.add_argument("--output-gb", type=float, default=40.)
+    parser.add_argument("--free-disk-gb", type=float, default=500.)
+    parser.add_argument("--memory-reserve-gb", type=float, default=16.)
+    parser.add_argument("--community-max-edges", type=int, default=MAX_COMMUNITY_EDGES)
+    parser.add_argument("--resolution", type=float, default=1.)
+    parser.add_argument("--seed", type=int, default=17729)
+    parser.add_argument("--iterations", type=int, default=-1)
+    parser.add_argument("--fixed-threshold", action="store_true")
+    args = parser.parse_args()
+    args.join_method = "bernoulli"
+    if (not 0 < args.threshold <= 1 or not 0 < args.threshold_step <= 1 or args.workers < 1
+            or args.community_workers < 1 or args.community_max_edges < 1
+            or args.resolution <= 0 or args.iterations == 0 or args.iterations < -1):
+        raise ValueError("Invalid graph/clustering settings")
+    required = args.memory_gb + args.memory_reserve_gb
+    if available_memory_gib() < required:
+        raise RuntimeError(f"Need at least {required:.1f} GiB available before starting")
+    if shutil.disk_usage(args.output.parent).free / GIB < args.free_disk_gb:
+        raise RuntimeError("Graph/partition would violate the free-disk reserve")
+    with np.load(args.split) as split:
+        train_index, feature_ids = split["train_index"], split["feature_ids"]
+    if not len(feature_ids):
+        raise ValueError("No prevalence-retained features")
+    if args.mode == "graph":
+        manifest, _ = build_graph(args, train_index, feature_ids)
+        print(json.dumps(manifest), flush=True)
+    else:
+        if args.graph_source is None:
+            raise ValueError("Clustering requires a completed source graph")
+        cluster_graph(args, train_index, feature_ids)
 
 
 if __name__ == "__main__":

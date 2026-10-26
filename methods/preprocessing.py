@@ -1,38 +1,21 @@
 """Input validation and training-local filtering of supplied values."""
 import numpy as np
 from scipy import sparse
+from dataclasses import dataclass
 
-def unique_day_zero_stool_mask(subjects, body_sites, days, reads, sample_ids):
-    """Select one day-zero stool sample per subject, preferring read depth."""
-    subjects = np.asarray(subjects, dtype=object)
-    body_sites = np.asarray(body_sites, dtype=object)
-    days = np.asarray(days, dtype=float)
-    reads = np.asarray(reads, dtype=float)
-    sample_ids = np.asarray(sample_ids, dtype=str)
-    if len({len(subjects), len(body_sites), len(days), len(reads), len(sample_ids)}) != 1:
-        raise ValueError("Baseline-selection columns must have equal lengths")
 
-    selected = np.zeros(len(subjects), dtype=bool)
-    best = {}
-    for index in np.flatnonzero(
-        np.array([isinstance(value, str) and bool(value) for value in subjects])
-        & (np.char.lower(body_sites.astype(str)) == "stool")
-        & (days == 0)
-    ):
-        subject = subjects[index]
-        incumbent = best.get(subject)
-        read_count = reads[index] if np.isfinite(reads[index]) else -np.inf
-        if incumbent is None:
-            best[subject] = index
-            continue
-        incumbent_reads = reads[incumbent] if np.isfinite(reads[incumbent]) else -np.inf
-        if read_count > incumbent_reads or (
-            read_count == incumbent_reads and sample_ids[index] < sample_ids[incumbent]
-        ):
-            best[subject] = index
-    selected[list(best.values())] = True
-    return selected
+@dataclass(frozen=True)
+class Preprocessing:
+    prevalence: float = .05
+    minimum_samples: int = 5
 
+    def __post_init__(self):
+        if not 0 < self.prevalence <= 1 or self.minimum_samples < 1:
+            raise ValueError("Invalid prevalence settings")
+
+    def fit(self, matrix, training):
+        mask, _, cutoff = prevalence_mask(matrix[training], self.prevalence, self.minimum_samples)
+        return np.flatnonzero(mask), cutoff
 
 def sample_support(matrix):
     """Count the samples with a positive value for each feature."""
@@ -59,16 +42,4 @@ def retained_pair_values(matrix, columns):
     if values.shape[1] and np.any(np.asarray(values.sum(axis=1)).ravel() <= 0):
         raise ValueError("Samples have no retained abundance")
     return values
-
-
-
-def validate_samples(matrix, samples, pb, pg):
-    if (matrix.shape != (len(samples), len(pb)) or len(pg) != len(pb) or
-            not np.isfinite(matrix.data).all() or np.any(matrix.data < 0) or
-            np.any(np.asarray(matrix.sum(axis=1)).ravel() <= 0) or
-            samples.sample_id.isna().any() or samples.sample_id.duplicated().any() or
-            ('subject_id' in samples and (samples.subject_id.isna().any() or samples.subject_id.duplicated().any())) or
-            set(samples.y.unique()) != {0, 1} or not np.issubdtype(pb.dtype, np.integer) or
-            not np.issubdtype(pg.dtype, np.integer) or np.any(pb < 0) or np.any(pg < 0)):
-        raise ValueError('Invalid independent samples, labels, abundance matrix or pair identifiers')
 

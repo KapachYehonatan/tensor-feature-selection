@@ -3,5 +3,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 outputs/
+cache/
 logs/
 .ipynb_checkpoints/

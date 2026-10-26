@@ -3,6 +3,8 @@
 from pathlib import Path
 from datetime import datetime, timezone
 import csv
+import argparse
+import importlib.util
 import fcntl
 import json
 import os
@@ -15,11 +17,8 @@ import time
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
-PREFIX = 'experiment'
 LIMIT_BYTES = 200*1024**3
 SAMPLE_SECONDS = 5
-RUNNER = PROJECT/'scripts/run_experiment.py'
-STUDY_OUTPUT = PROJECT/'outputs/.cache/provenance/run'
 
 
 def process_tree(root):
@@ -62,8 +61,18 @@ def cgroup_values():
 
 
 def main():
-    logs = PROJECT/'logs'
-    logs.mkdir(exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("experiment", help="Project module such as experiments.main_comparison")
+    args, forwarded = parser.parse_known_args()
+    PREFIX = args.experiment.removeprefix("experiments.")
+    if not args.experiment.startswith("experiments.") or not PREFIX.isidentifier():
+        parser.error("Choose a plain experiments.<module> inside this project")
+    spec = importlib.util.find_spec(args.experiment)
+    if spec is None or not Path(spec.origin).resolve().is_relative_to(PROJECT / "experiments"):
+        parser.error("Experiment module does not exist in this project")
+    STUDY_OUTPUT = PROJECT / "outputs" / PREFIX / ".cache"
+    logs = STUDY_OUTPUT / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
     with (logs/f'{PREFIX}.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         group = cgroup_values()
@@ -72,7 +81,7 @@ def main():
             raise RuntimeError('Launch in a user service with MemoryMax=200G and MemorySwapMax=0')
         env = os.environ.copy()
         env.update({n: '1' for n in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS', 'BLIS_NUM_THREADS')})
-        child = subprocess.Popen([str(PROJECT/'.venv/bin/python'), '-u', str(RUNNER)],
+        child = subprocess.Popen([str(PROJECT/'.venv/bin/python'), '-u', '-m', args.experiment, *forwarded],
             cwd=PROJECT, env=env, start_new_session=True)
         (logs/f'{PREFIX}.pid').write_text(str(child.pid)+'\n')
         (logs/f'{PREFIX}.supervisor.pid').write_text(str(os.getpid())+'\n')
@@ -109,22 +118,8 @@ def main():
             sampled_peak_tree_rss_bytes=peak_rss, sampled_cgroup_peak_bytes=peak_cgroup,
             memory_limit_triggered=killed, cpu_user_seconds=usage.ru_utime, cpu_system_seconds=usage.ru_stime,
             cgroup=cgroup_values(), finished_utc=datetime.now(timezone.utc).isoformat(),
-            note='Tree RSS double-counts shared pages; cgroup peak includes cache. Native threads=1, join workers=4, Leiden workers=1.')
+            note='Tree RSS double-counts shared pages; cgroup peak includes cache. Native threads=1; scientific worker settings are declared by the experiment.')
         (logs/f'{PREFIX}.exit.json').write_text(json.dumps(summary, indent=2))
-        if child.returncode:
-            import pandas as pd
-            status = STUDY_OUTPUT/'status.csv'
-            if status.exists():
-                rows = pd.read_csv(status)
-                running = rows.status.eq('running')
-                rows.loc[running, 'status'] = 'failed'
-                rows.loc[running, 'error'] = f'Interrupted process exit {child.returncode}; see logs/{PREFIX}.exit.json'
-                rows.to_csv(status, index=False)
-            result = STUDY_OUTPUT/'result.json'
-            saved = json.loads(result.read_text()) if result.exists() else {}
-            if saved.get('status', 'running') == 'running':
-                saved.update(status='interrupted', resource_summary=summary)
-                result.write_text(json.dumps(saved, indent=2))
         print(PREFIX+' exit: '+json.dumps(summary), flush=True)
         sys.exit(child.returncode if child.returncode >= 0 else 128-child.returncode)
 

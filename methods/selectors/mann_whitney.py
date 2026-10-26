@@ -1,9 +1,58 @@
-"""Unscreened MW ranking and separate complete-family BH/BY discoveries."""
+"""Unscreened MW ranking and separate complete-family discoveries."""
 import numpy as np
-import pandas as pd
 from scipy import sparse, stats
+from dataclasses import asdict, dataclass, field
+from methods.correction import BY
+from methods.selectors.correlation import greedy_filter
 
 MANN_WHITNEY_CHUNK = 2000
+
+
+@dataclass(frozen=True)
+class MannWhitney:
+    kind = "p"
+    correction: BY = field(default_factory=BY)
+    correlation_threshold: float | None = None
+
+    def __post_init__(self):
+        if self.correlation_threshold is not None and not 0 < self.correlation_threshold < 1:
+            raise ValueError("Invalid Pearson threshold")
+
+    def test(self, matrix, y):
+        p, effects = mann_whitney_many(matrix, [np.asarray(y)])
+        return dict(p=p[0], effect=effects)
+
+    def batch_test(self, matrix, targets, prepared=None):
+        return np.asarray(mann_whitney_many(matrix, targets)[0])
+
+    def family_size(self, candidates, original):
+        return candidates
+
+    def prepare(self, matrix):
+        return None
+
+    def test_settings(self):
+        return {k: v for k, v in asdict(self).items() if k not in {"correction", "correlation_threshold"}}
+
+    def dependencies(self):
+        return (type(self).test, type(self).batch_test, type(self).test_settings, mann_whitney_many)
+
+    def selection_dependencies(self):
+        return (type(self).select, type(self).family_size, type(self.correction).adjust, greedy_filter)
+
+    def select(self, evidence, matrix, ids, family_size, rank_limit):
+        p = evidence["p"]
+        order = np.lexsort((ids, p))
+        q = self.correction.adjust(p)
+        native = order[q[order] <= self.correction.alpha]
+        if self.correlation_threshold is not None:
+            accepted = greedy_filter(matrix, native, self.correlation_threshold)
+            working = np.ones(len(p))
+            working[accepted] = p[accepted]
+            q = self.correction.adjust(working)
+            native = accepted[q[accepted] <= self.correction.alpha]
+            order = greedy_filter(matrix, order, self.correlation_threshold, rank_limit)
+        return dict(order=order[:rank_limit], native=native, q=q)
 
 def mann_whitney_many(matrix, targets, chunk_size=MANN_WHITNEY_CHUNK):
     """Compute two-sided MW statistics for the supplied target arrays."""
@@ -24,32 +73,3 @@ def mann_whitney_many(matrix, targets, chunk_size=MANN_WHITNEY_CHUNK):
                 denominator = positive.sum() * negative.sum()
                 real_effect[start:end] = 2 * np.asarray(result.statistic) / denominator - 1
     return p_values, real_effect
-
-
-def multiple_testing(p):
-    """Correct the complete eligible family, independently of prediction Top-K."""
-    p = np.asarray(p, dtype=float)
-    if p.ndim != 1 or not np.isfinite(p).all() or np.any((p < 0) | (p > 1)):
-        raise ValueError('Multiple testing requires finite p-values in [0, 1]')
-    return {name: stats.false_discovery_control(p, method=name) if p.size else p.copy()
-            for name in ('bh', 'by')}
-
-
-def mw_ranked_family(train, y, ids, level, sizes, alpha=.10):
-    """Label-blind constant exclusion, then unfiltered p/ID ranking and BH/BY."""
-    train = sparse.csc_matrix(train)
-    eligible = (np.flatnonzero(train.max(axis=0).toarray().ravel() >
-                              train.min(axis=0).toarray().ravel())
-                if train.shape[1] else np.array([], dtype=int))
-    p, effect = mann_whitney_many(train[:, eligible], [np.asarray(y)])
-    adjusted = multiple_testing(p[0])
-    order = np.lexsort((np.asarray(ids)[eligible], p[0]))
-    columns = eligible[order]
-    table = pd.DataFrame(dict(rank=np.arange(1, len(columns)+1), level=level,
-        feature_id=np.asarray(ids)[columns], pair_count=np.asarray(sizes)[columns],
-        p=p[0][order], effect=effect[order]))
-    for correction in ('bh', 'by'):
-        table['q_'+correction] = adjusted[correction][order]
-        table['significant_'+correction] = table['q_'+correction].le(alpha)
-    return columns, table
-
