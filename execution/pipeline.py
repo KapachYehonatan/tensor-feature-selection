@@ -262,8 +262,7 @@ def run(experiment):
     output = cache.PROJECT / "outputs" / experiment.name
     tables = output / ".cache"
     tables.mkdir(parents=True, exist_ok=True)
-    for filename in experiment.outputs:
-        (output / filename).unlink(missing_ok=True)
+    # Existing figures retain their stated coverage until new results are rendered.
     for name in ("fold_metrics.csv", "predictions.csv.gz", "prediction_summary.csv", "full_metrics.csv",
                  "topk_correlations.csv", "p_value_comparison.csv", "summary.csv", "failures.csv", "artifacts.csv"):
         path = tables / name

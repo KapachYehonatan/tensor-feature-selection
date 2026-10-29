@@ -18,8 +18,8 @@ restriction on the research.
 - `tests/test_experiment.py`: small scientific and cache-integrity fixtures.
 
 The two current experiments are `main_comparison` (Bacteria-collapsed,
-Gene-collapsed, Bernoulli-join and Bins e-value across eight datasets) and
-`join_correlation_filter` (QinJ/Nielsen, explicit Pearson cutoff list).
+Gene-collapsed, Bernoulli-join and Bins e-value across sixteen datasets) and
+`join_correlation_filter` (QinJ/Nielsen plus the eight additions, explicit Pearson cutoff list).
 Edit their Python definitions to change components, datasets, grids or outputs.
 Preprocessing is shared by all methods within an experiment; graph and Leiden
 settings belong to their separate components. Graphs can be reused when only a
@@ -77,6 +77,16 @@ Strict signatures include actual stage inputs, settings, kernels and relevant
 software. Incompatible stages receive distinct keys; damaged checkpoints fail.
 Plotting/docs/tests do not invalidate scientific caches. Missing results are
 explicit and plotting cannot trigger computation.
+
+`experiments.extend_datasets` acquires the eight approved cohorts using pinned
+cMD/ASAP sources, exports unchanged sparse values into `cache/inputs/`, waits for
+active comparison jobs, then runs the expanded main comparison and correlation
+filters `.8 .7`. Downloads, checksums, import protocols and an accession-overlap
+audit stay in `cache/downloads/`. Converters use the installed base R and Arrow
+environments read-only. Launch through `execution.resources`, using
+`--log-directory outputs/main_comparison/.cache/logs/extension`. Existing scientific
+caches are reused; graph launches retain the RAM guard and use the approved
+100-GiB free-disk reserve, recorded separately from scientific cache protocols.
 
 ## Research agents
 

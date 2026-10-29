@@ -4,11 +4,12 @@ import math
 from execution.spec import Experiment
 from methods.pipelines import BernoulliJoin
 from methods.selectors.mann_whitney import MannWhitney
+from datasets.catalog import NEW_DATASETS
 
 
 def experiment(thresholds):
     return Experiment(
-        name="join_correlation_filter", datasets=("QinJ_2012", "NielsenHB_2014_unique"),
+        name="join_correlation_filter", datasets=("QinJ_2012", "NielsenHB_2014_unique") + NEW_DATASETS,
         methods=(BernoulliJoin(),) + tuple(BernoulliJoin(
             selector=MannWhitney(correlation_threshold=t), name=f"Join + filter {t!r}") for t in thresholds),
         metrics=("prediction", "discoveries", "correlation", "shuffled_fdp"),

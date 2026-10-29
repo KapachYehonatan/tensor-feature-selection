@@ -63,6 +63,7 @@ def cgroup_values():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("experiment", help="Project module such as experiments.main_comparison")
+    parser.add_argument("--log-directory", type=Path, help="Private project output directory for an operational run")
     args, forwarded = parser.parse_known_args()
     PREFIX = args.experiment.removeprefix("experiments.")
     if not args.experiment.startswith("experiments.") or not PREFIX.isidentifier():
@@ -71,7 +72,9 @@ def main():
     if spec is None or not Path(spec.origin).resolve().is_relative_to(PROJECT / "experiments"):
         parser.error("Experiment module does not exist in this project")
     STUDY_OUTPUT = PROJECT / "outputs" / PREFIX / ".cache"
-    logs = STUDY_OUTPUT / 'logs'
+    logs = args.log_directory.resolve() if args.log_directory else STUDY_OUTPUT / 'logs'
+    if not logs.is_relative_to(PROJECT / 'outputs') or '.cache' not in logs.parts:
+        parser.error('Logs must stay in a private project outputs/.cache directory')
     logs.mkdir(parents=True, exist_ok=True)
     with (logs/f'{PREFIX}.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

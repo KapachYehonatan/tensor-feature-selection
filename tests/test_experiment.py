@@ -4,15 +4,18 @@ from pathlib import Path
 from typing import ClassVar
 from unittest.mock import patch
 import itertools
+import hashlib
 import json
 import tempfile
 import unittest
+import subprocess
 import numpy as np
 import pandas as pd
 from scipy import sparse, stats
 from scipy.io import mmwrite
 from datasets.loading import load, validate
 from datasets.prepare import prepare
+from datasets import acquire
 from execution import cache, pipeline
 from execution.spec import Experiment, Evaluation
 from methods.preprocessing import Preprocessing, retained_pair_values
@@ -165,6 +168,86 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(result.samples.sample_id.tolist(), ["b", "c"])
         self.assertEqual(result.pair_bacteria.tolist(), [0, 1])
 
+    def test_new_cohort_export_counts_values_and_resumption(self):
+        source = self.root / 'sources/YachidaS_2019'
+        source.mkdir(parents=True)
+        (source / 'YachidaS_2019_genes.txt').write_text('g0|b0\ng1|b1\ng2|unclassified\n')
+        (source / 'YachidaS_2019_samples.txt').write_text('a\nb\nc\nd\n')
+        pd.DataFrame(dict(sample_id=list('abcd'), subject_id=['p0', 'p1', 'p2', 'p3'],
+            disease=['healthy', 'healthy', 'CRC', 'CRC'])).to_csv(source / 'YachidaS_2019_metadata.tsv', sep='\t', index=False)
+        values = np.array([[1., 2, 3, 4], [.1, .2, 0, .4], [9, 9, 9, 9]])
+        mmwrite(source / 'YachidaS_2019_gene_families.mtx', sparse.coo_matrix(values))
+        with patch.object(acquire, 'SOURCE', source.parent), patch.object(acquire, 'DOWNLOADS', self.root / 'downloads'), \
+             patch.dict(acquire.COHORTS, {'YachidaS_2019': ('disease', 'healthy', 'CRC', 2, 2)}), \
+             patch.object(acquire, 'conversion_versions', return_value={'fixture': True}):
+            acquire.prepare_one('YachidaS_2019', pd.DataFrame(), pd.DataFrame())
+            result = load('YachidaS_2019')
+            np.testing.assert_array_equal(result.values.toarray(), values[:2].T)
+            folder = cache.CACHE / 'inputs/YachidaS_2019'
+            protocol = json.loads((folder / 'protocol.json').read_text())
+            protocol['code']['datasets.acquire.read_sparse_rds'] = 'unused old converter'
+            protocol['files'][str(Path(acquire.__file__).with_name('read_cmd.R'))] = 'unused old reader'
+            old_key = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
+            cache.write_json(folder / 'protocol.json', protocol)
+            cache.seal(folder, old_key, [p for p in folder.iterdir() if p.name != 'complete.json'])
+            with patch('datasets.prepare.mmread', side_effect=AssertionError('Reimported completed cohort')):
+                acquire.prepare_one('YachidaS_2019', pd.DataFrame(), pd.DataFrame())
+            self.assertEqual(json.loads((folder / 'compatibility.json').read_text())['original_signature'], old_key)
+            damaged = dict(protocol, settings=dict(protocol['settings'], positive='changed target'))
+            cache.write_json(folder / 'protocol.json', damaged)
+            with self.assertRaisesRegex(ValueError, 'incompatible'):
+                acquire.prepare_one('YachidaS_2019', pd.DataFrame(), pd.DataFrame())
+            with self.assertRaisesRegex(ValueError, 'labels changed'):
+                acquire.check_counts(result.samples.iloc[:-1], 'YachidaS_2019')
+
+    def test_approved_metacardis_zero_classified_exclusions(self):
+        name = 'MetaCardis_2020_a'
+        folder = self.root / name
+        folder.mkdir()
+        ids = [f's{i}' for i in range(18)]
+        (folder / f'{name}_samples.txt').write_text('\n'.join(ids) + '\n')
+        (folder / f'{name}_genes.txt').write_text('g0|b0\ng1|unclassified\n')
+        pd.DataFrame(dict(sample_id=ids, disease=['T2D'] * 12 + ['healthy'] * 4 + ['T2D', 'healthy'])).to_csv(
+            folder / f'{name}_metadata.tsv', sep='\t', index=False)
+        values = np.vstack([np.r_[np.zeros(16), [2.5, 7]], np.ones(18)])
+        mmwrite(folder / f'{name}_gene_families.mtx', sparse.coo_matrix(values))
+        matrix, _, samples, _, omitted = acquire.metacardis_source(folder)
+        np.testing.assert_array_equal(matrix.toarray(), values[:, -2:])
+        self.assertEqual(samples, ids[-2:])
+        self.assertEqual(omitted.disease.value_counts().to_dict(), {'T2D': 12, 'healthy': 4})
+
+    def test_base_r_sparse_slots_and_arrow_cohort_extraction(self):
+        if not acquire.R.exists() or not acquire.PARQUET_PYTHON.exists():
+            self.skipTest('Optional installed source converters unavailable')
+        rds = self.root / 'fixture.rds'
+        for kind, second, contents, container in [
+            (kind, slot, contents, container)
+            for kind, slot, contents in [('dgCMatrix', 'p', 'c(0L,2L,3L)'), ('dgTMatrix', 'j', 'c(0L,0L,1L)')]
+            for container in ('rds', 'rdata')]:
+            expression = ('args<-commandArgs(TRUE);setClass("' + kind + '",slots=c(i="integer",' + second +
+                '="integer",Dim="integer",Dimnames="list",x="numeric"));'
+                'x<-new("' + kind + '",i=c(0L,1L,1L),' + second + '=' + contents + ',Dim=c(2L,2L),'
+                'Dimnames=list(c("g0|b0","g1|b1"),c("a","b")),x=c(2,.5,7));'
+                + ('saveRDS(x,args[1])' if container == 'rds' else 'save(x,file=args[1],compress="bzip2")'))
+            subprocess.run([str(acquire.R), '-e', expression, str(rds)], check=True)
+            directory = self.root / (kind + container)
+            matrix, features, samples = acquire.read_sparse_rds(rds, directory)
+            np.testing.assert_array_equal(matrix.toarray(), [[2, 0], [.5, 7]])
+            self.assertEqual(features, ['g0|b0', 'g1|b1'])
+            self.assertEqual(samples, ['a', 'b'])
+            acquire.read_sparse_rds(rds, directory)
+        expression = '''import sys, pandas as pd, pyarrow as pa, pyarrow.parquet as pq
+from pathlib import Path
+from scipy import sparse
+from datasets.read_parquet import extract
+p=Path(sys.argv[1]);pd.DataFrame(dict(sample_id=['a','b'],uuid=['u0','u1'])).to_csv(p/'meta.csv',index=False)
+pq.write_table(pa.table(dict(uuid=['u0','other','u1','u0'],gene_family=['g0|b0','g9|b9','g1|b1','g9|unclassified'],rpk_abundance=[.01,99.,.02,88.])),p/'fixture.parquet',row_group_size=1)
+extract(p/'fixture.parquet',p/'meta.csv',p)
+assert sparse.load_npz(p/'values.npz').toarray().tolist()==[[.01,0],[0,.02]]
+'''
+        subprocess.run([str(acquire.PARQUET_PYTHON), '-c', expression, str(self.root)],
+                       cwd=Path(__file__).resolve().parents[1], check=True)
+
     def test_mw_by_and_masked_correlation_family(self):
         a = np.array([-1, -1, 1, 1])
         c = np.array([-1, 1, -1, 1])
@@ -251,6 +334,24 @@ class ExperimentTests(unittest.TestCase):
         self.assertAlmostEqual(average_pairwise_absolute_correlation(x, [0, 1])["average_pairwise_absolute_correlation"], 1)
         self.assertEqual(average_pairwise_absolute_correlation(None, [])["status"], "undefined_subset_size")
         self.assertEqual(average_pairwise_absolute_correlation(None, range(10001))["status"], "skipped_size_limit")
+
+    def test_extension_disk_override_preserves_scientific_settings(self):
+        from experiments import extend_datasets as extension
+        graph = BernoulliGraph()
+        before = dict(graph.__dict__)
+        for mode in ('graph', 'cluster'):
+            command = graph.command('matrix.npz', 'selection.npz', 'work') + ['--mode', mode]
+            expected = command.copy()
+            expected[expected.index('--free-disk-gb') + 1] = '100'
+            with patch.object(extension.Path, 'read_text', return_value='MemAvailable: 200000000 kB'), \
+                    patch.object(extension.shutil, 'disk_usage') as disk, \
+                    patch.object(extension, 'ORIGINAL_RUN') as run, \
+                    patch.object(extension.time, 'sleep', side_effect=AssertionError('Unnecessary wait')):
+                disk.return_value.free = 150 * 1024**3
+                extension.graph_run(command, check=True)
+                run.assert_called_once_with(expected, check=True)
+            self.assertEqual(command[command.index('--free-disk-gb') + 1], '500')
+        self.assertEqual(graph.__dict__, before)
 
     def test_graph_guards_and_float32_boundary(self):
         self.assertEqual(worker.fallback_thresholds(.7), [.7, .75, .8, .85, .9, .95, 1.])

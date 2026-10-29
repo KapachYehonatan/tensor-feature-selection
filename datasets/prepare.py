@@ -10,22 +10,30 @@ from datasets.loading import unique_day_zero_stool_mask
 
 
 def pair_dictionary(path):
-    valid, genes, bacteria, pg, pb = [], {}, {}, [], []
     with Path(path).open() as handle:
-        for index, line in enumerate(handle):
-            name = line.rstrip("\n")
-            if "|" not in name:
-                continue
-            gene, bacterium = name.split("|", 1)
-            if not gene or not bacterium or bacterium == "unclassified":
-                continue
-            if gene not in genes:
-                genes[gene] = len(genes)
-            if bacterium not in bacteria:
-                bacteria[bacterium] = len(bacteria)
-            valid.append(index)
-            pg.append(genes[gene])
-            pb.append(bacteria[bacterium])
+        return pair_mapping(handle)
+
+
+def pair_mapping(names):
+    valid, genes, bacteria, pg, pb = [], {}, {}, [], []
+    seen = set()
+    for index, line in enumerate(names):
+        name = line.rstrip("\n")
+        if "|" not in name:
+            continue
+        gene, bacterium = name.split("|", 1)
+        if not gene or not bacterium or bacterium == "unclassified":
+            continue
+        if name in seen:
+            raise ValueError("Duplicate classified pair identifier")
+        seen.add(name)
+        if gene not in genes:
+            genes[gene] = len(genes)
+        if bacterium not in bacteria:
+            bacteria[bacterium] = len(bacteria)
+        valid.append(index)
+        pg.append(genes[gene])
+        pb.append(bacteria[bacterium])
     return np.asarray(valid, int), np.asarray(pb, np.int32), np.asarray(pg, np.int32), genes, bacteria
 
 
@@ -39,10 +47,30 @@ def prepare(name, source_directory, source_study, *, target_column, negative_lab
              dict(matrix="gene_families.mtx", features="genes.txt", samples="samples.txt", metadata="metadata.tsv").items()}
     sample_ids = [line.strip() for line in paths["samples"].read_text().splitlines() if line.strip()]
     metadata = pd.read_csv(paths["metadata"], sep="\t", low_memory=False)
+    raw = mmread(paths["matrix"], spmatrix=True)
+    with paths["features"].open() as handle:
+        return prepare_matrix(name, raw, handle, sample_ids, metadata, source_study=source_study,
+            target_column=target_column, negative_label=negative_label, positive_label=positive_label,
+            independent_day_zero=independent_day_zero, destination=destination)
+
+
+def prepare_matrix(name, raw, feature_names, sample_ids, metadata, *, source_study,
+                   target_column, negative_label, positive_label, independent_day_zero=False,
+                   destination=None):
+    """Export supplied values from a sparse table; no learned filtering or transforms."""
+    if not name or name.startswith(".") or "/" in name or "\\" in name:
+        raise ValueError("Invalid dataset name")
+    if len(set(sample_ids)) != len(sample_ids):
+        raise ValueError("Duplicate source sample IDs")
+    feature_names = list(feature_names)
+    if not sparse.issparse(raw) or raw.shape not in ((len(feature_names), len(sample_ids)), (len(sample_ids), len(feature_names))):
+        raise ValueError("Sparse source dimensions do not match samples/features")
     sample_column = "sample_id" if "sample_id" in metadata else "SampleID"
     if metadata[sample_column].duplicated().any():
         raise ValueError("Duplicate source sample IDs")
     metadata = metadata.set_index(sample_column).reindex(sample_ids)
+    if metadata[target_column].isna().any():
+        raise ValueError("Source samples are missing target metadata")
     labels = metadata[target_column].astype(str)
     keep = labels.isin([negative_label, positive_label]).to_numpy(copy=True)
     if independent_day_zero:
@@ -55,8 +83,7 @@ def prepare(name, source_directory, source_study, *, target_column, negative_lab
     samples = samples.reset_index(drop=True)
     if samples.empty or set(samples.y) != {0, 1} or ("subject_id" in samples and samples.subject_id.duplicated().any()):
         raise ValueError("Cohort must contain independent participants and both labels")
-    valid, pb, pg, genes, bacteria = pair_dictionary(paths["features"])
-    raw = mmread(paths["matrix"], spmatrix=True)
+    valid, pb, pg, genes, bacteria = pair_mapping(feature_names)
     if raw.shape[1] == len(sample_ids):
         matrix = sparse.csr_matrix(raw.T)
     elif raw.shape[0] == len(sample_ids):
