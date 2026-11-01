@@ -1,8 +1,10 @@
 """Small supplied-value, inference, stage-cache, and reporting fixtures only."""
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import ClassVar
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
+import fcntl
 import itertools
 import hashlib
 import json
@@ -16,7 +18,7 @@ from scipy.io import mmwrite
 from datasets.loading import load, validate
 from datasets.prepare import prepare
 from datasets import acquire
-from execution import cache, pipeline
+from execution import cache, pipeline, resources
 from execution.spec import Experiment, Evaluation
 from methods.preprocessing import Preprocessing, retained_pair_values
 from methods.pipelines import Bacteria, Gene, BernoulliJoin, BinsEValue, construct
@@ -24,7 +26,7 @@ from methods.graphs.bernoulli_join import BernoulliGraph
 from methods.clustering.leiden import Leiden
 from methods.graphs import worker
 from methods.selectors import bins
-from methods.selectors.mann_whitney import MannWhitney, mann_whitney_many
+from methods.selectors.mann_whitney import MannWhitney, mann_whitney_many, prepare_mann_whitney
 from methods.selectors.correlation import greedy_filter
 from methods.correction import BY, EBH
 from metrics.prediction import predict_model, summarize
@@ -100,6 +102,45 @@ class ExperimentTests(unittest.TestCase):
         np.savez_compressed(directory / "edges.npz", pair_bacteria=[0, 0, 1, 2], pair_gene=[0, 1, 0, 1])
         pd.DataFrame(dict(sample_id=[f"s{i}" for i in range(24)], subject_id=[f"p{i}" for i in range(24)], y=y)).to_csv(directory / "samples.csv", index=False)
         return load("toy")
+
+    def test_supervisor_requires_memory_and_swap_caps(self):
+        caps = {'memory.max': str(resources.LIMIT_BYTES), 'memory.swap.max': '0'}
+        child = Mock(pid=123, returncode=0)
+        child.poll.return_value = 0
+        with patch.object(resources, 'PROJECT', self.root), \
+             patch.object(resources.importlib.util, 'find_spec', return_value=SimpleNamespace(
+                 origin=str(self.root / 'experiments/main_comparison.py'))), \
+             patch.object(resources.sys, 'argv', ['resources', 'experiments.main_comparison']), \
+             patch.object(resources.subprocess, 'Popen', return_value=child) as launch:
+            for group in ({}, dict(caps, **{'memory.max': 'max'}),
+                          dict(caps, **{'memory.max': str(resources.LIMIT_BYTES + 1)}),
+                          {'memory.max': str(resources.LIMIT_BYTES)},
+                          dict(caps, **{'memory.swap.max': 'max'}),
+                          dict(caps, **{'memory.swap.max': '1'})):
+                with self.subTest(group=group), patch.object(resources, 'cgroup_values', return_value=group):
+                    with self.assertRaisesRegex(RuntimeError, 'MemorySwapMax=0'):
+                        resources.main()
+            launch.assert_not_called()
+            with patch.object(resources, 'cgroup_values', return_value=caps), self.assertRaises(SystemExit) as stopped:
+                resources.main()
+            self.assertEqual(stopped.exception.code, 0)
+            launch.assert_called_once()
+
+    def test_supervisor_custom_logs_share_the_experiment_lock(self):
+        logs = self.root / 'outputs/main_comparison/.cache/logs'
+        logs.mkdir(parents=True)
+        alternate = self.root / 'outputs/main_comparison/.cache/other_logs'
+        with (logs / 'main_comparison.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(resources, 'PROJECT', self.root), \
+                 patch.object(resources.importlib.util, 'find_spec', return_value=SimpleNamespace(
+                     origin=str(self.root / 'experiments/main_comparison.py'))), \
+                 patch.object(resources.sys, 'argv', ['resources', 'experiments.main_comparison',
+                     '--log-directory', str(alternate)]), \
+                 patch.object(resources.subprocess, 'Popen') as launch:
+                with self.assertRaises(BlockingIOError):
+                    resources.main()
+                launch.assert_not_called()
 
     def test_common_preprocessing_supplied_means_and_validation_isolation(self):
         data = self.dataset()
@@ -270,6 +311,55 @@ assert sparse.load_npz(p/'values.npz').toarray().tolist()==[[.01,0],[0,.02]]
         for j in range(2):
             self.assertEqual(actual[0][j], stats.mannwhitneyu(values[:2, j], values[2:, j], alternative="two-sided", method="asymptotic").pvalue)
 
+    def test_prepared_mw_matches_scipy_with_ties_unequal_groups_and_threads(self):
+        values = sparse.csr_matrix(np.array([
+            [0, 1, 0, 0], [0, 1, 1, 0], [1, 2, 1, 1],
+            [1, 3, 2, 1], [3, 3, 0, 3], [5, 4, 3, 5],
+        ], dtype=float))
+        targets = np.array([np.isin(np.arange(6), group).astype(int)
+            for size in range(1, 6) for group in itertools.combinations(range(6), size)])
+        expected = np.asarray(mann_whitney_many(values, targets)[0])
+        for workers in (1, 24):
+            prepared = prepare_mann_whitney(values, workers=workers)
+            np.testing.assert_array_equal(prepared.test(targets), expected)
+            np.testing.assert_array_equal(prepared.test(1 - targets), expected)
+            self.assertEqual(prepared.ranks.nnz, values.nnz)
+        self.assertEqual(prepare_mann_whitney(values[:, :0]).test(targets).shape, (62, 0))
+        for invalid in (sparse.csr_matrix(np.zeros((6, 1))), sparse.csr_matrix(np.ones((6, 1))),
+                        values.astype(np.float32), -values):
+            with self.assertRaises(ValueError):
+                prepare_mann_whitney(invalid)
+        for invalid in (np.ones((1, 6)), np.full((1, 6), np.nan), np.ones((1, 5))):
+            with self.assertRaises(ValueError):
+                prepared.test(invalid)
+
+    def test_prepared_mw_checkpoint_prefix_and_implementation_rejection(self):
+        data = self.dataset()
+        family = pipeline.Family('fixture', self.root, data.values[:, 1:3].astype(float), np.array([1, 2]), 4, {})
+        method = Gene()
+        evaluation = Evaluation(folds=2, fine_k=(1,), coarse_k=(1,), shuffles=5)
+        expected, keys = pipeline.shuffled_counts(data, family, [method], evaluation)
+        directory = cache.CACHE / 'stages/toy/full/shuffles' / keys[method.name]
+        sidecar = directory / 'mw_shuffle_execution.json'
+        self.assertTrue(json.loads(sidecar.read_text())['p_values_order_and_discoveries_match'])
+        (directory / 'complete.json').unlink()
+        (directory / 'counts.npy').unlink()
+        partial = expected[method.name].copy()
+        partial[2:] = -1
+        np.save(directory / 'checkpoint/counts.npy', partial)
+        cache.seal(directory / 'checkpoint', keys[method.name], [directory / 'checkpoint/counts.npy'])
+        actual, _ = pipeline.shuffled_counts(data, family, [method], evaluation)
+        np.testing.assert_array_equal(actual[method.name], expected[method.name])
+        before = (directory / 'counts.npy').stat().st_mtime_ns
+        with patch('methods.selectors.mann_whitney.ThreadPoolExecutor', side_effect=AssertionError('Recomputed completed shuffles')):
+            pipeline.shuffled_counts(data, family, [method], evaluation)
+        self.assertEqual((directory / 'counts.npy').stat().st_mtime_ns, before)
+        changed = json.loads(sidecar.read_text())
+        changed['signature'] = 'changed'
+        cache.write_json(sidecar, changed)
+        with self.assertRaisesRegex(ValueError, 'Changed Mann-Whitney shuffle implementation'):
+            pipeline.shuffled_counts(data, family, [method], evaluation)
+
     def test_exact_bins_full_catalog_and_native_ties(self):
         x = sparse.csr_matrix([[0, 1], [0, 1], [1, 2], [2, 3], [4, 4], [8, 5.]])
         targets = np.array([np.isin(np.arange(6), s).astype(int) for s in itertools.combinations(range(6), 3)])
@@ -342,7 +432,7 @@ assert sparse.load_npz(p/'values.npz').toarray().tolist()==[[.01,0],[0,.02]]
         for mode in ('graph', 'cluster'):
             command = graph.command('matrix.npz', 'selection.npz', 'work') + ['--mode', mode]
             expected = command.copy()
-            expected[expected.index('--free-disk-gb') + 1] = '100'
+            expected[expected.index('--free-disk-gb') + 1] = '50'
             with patch.object(extension.Path, 'read_text', return_value='MemAvailable: 200000000 kB'), \
                     patch.object(extension.shutil, 'disk_usage') as disk, \
                     patch.object(extension, 'ORIGINAL_RUN') as run, \
@@ -363,6 +453,60 @@ assert sparse.load_npz(p/'values.npz').toarray().tolist()==[[.01,0],[0,.02]]
             worker.choose_effective_threshold({1.: 501}, 500)
         np.testing.assert_array_equal(worker.stable_cluster_labels([0, 1], [0, -1], [2, 4], 4), [0, 1])
 
+    def test_graph_resumes_only_explicit_unsealed_resource_abort(self):
+        @dataclass(frozen=True)
+        class AbortingGraph(TinyGraph):
+            status: ClassVar[str] = 'aborted_resource_limit'
+
+            def build(self, matrix, selection, output):
+                if type(self).status == 'complete':
+                    return super().build(matrix, selection, output)
+                cache.write_json(output / 'graph/run.json', {'status': type(self).status})
+                raise subprocess.CalledProcessError(1, ['fixture graph'])
+
+        data = self.dataset()
+        context = pipeline.Context('full', np.arange(len(data.samples)), np.array([], int))
+        method = BernoulliJoin(graph=AbortingGraph(), clustering=TinyLeiden())
+        with self.assertRaises(subprocess.CalledProcessError):
+            pipeline.prepare_family(data, context, Preprocessing(), method)
+        graph = next((cache.CACHE / 'stages/toy/full/graph').iterdir())
+        work = graph / 'work'
+        manifest = work / 'graph/run.json'
+        aborted = manifest.read_bytes()
+        AbortingGraph.status = 'complete'
+        for status in ('complete', 'failed'):
+            cache.write_json(manifest, {'status': status})
+            with self.assertRaises(FileExistsError):
+                pipeline.prepare_family(data, context, Preprocessing(), method)
+            self.assertEqual(json.loads(manifest.read_text())['status'], status)
+        manifest.unlink()
+        with self.assertRaises(FileExistsError):
+            pipeline.prepare_family(data, context, Preprocessing(), method)
+        manifest.write_text('{malformed')
+        with self.assertRaises(json.JSONDecodeError):
+            pipeline.prepare_family(data, context, Preprocessing(), method)
+        manifest.write_bytes(aborted)
+        for index, path in enumerate((work, work / 'graph', manifest)):
+            protected = self.root / f'protected_{index}'
+            path.rename(protected)
+            path.symlink_to(protected, target_is_directory=protected.is_dir())
+            with self.assertRaisesRegex(ValueError, 'outside its stage'):
+                pipeline.prepare_family(data, context, Preprocessing(), method)
+            self.assertTrue(protected.exists())
+            path.unlink()
+            protected.rename(path)
+        builds = TinyGraph.calls
+        family = pipeline.prepare_family(data, context, Preprocessing(), method)
+        self.assertEqual(json.loads((graph / 'aborted_run.json').read_text()), json.loads(aborted))
+        self.assertFalse((graph / 'work/graph/run.json').exists())
+        # A completed graph is still reused and never moved aside.
+        pipeline.prepare_family(data, context, Preprocessing(), method)
+        self.assertEqual(TinyGraph.calls, builds + 1)
+        self.assertEqual(family.references['graph'], graph.name)
+        (graph / 'work/graph.json').write_text('damaged')
+        with self.assertRaisesRegex(ValueError, 'Changed stage artifact'):
+            pipeline.prepare_family(data, context, Preprocessing(), method)
+
     def test_metric_protocol_rejects_changed_metrics_but_allows_plot_styling(self):
         experiment = Experiment("metric_fixture", ("toy",), (Bacteria(),), ("correlation",),
                                 ("average_pairwise_absolute_correlation_overview.png",))
@@ -378,6 +522,78 @@ assert sparse.load_npz(p/'values.npz').toarray().tolist()==[[.01,0],[0,.02]]
         with patch.object(cache, "file_hash", return_value="changed metric implementation"):
             with self.assertRaisesRegex(ValueError, "metric definitions changed"):
                 comparison.render(experiment)
+
+    def test_failed_rerun_preserves_saved_tables_protocol_and_figures(self):
+        data = self.dataset()
+        experiment = Experiment('preserved', ('toy', 'missing'), (Bacteria(),), ('discoveries',),
+                                ('real_discoveries_overview.png',))
+        output = self.root / 'outputs/preserved'
+        tables = output / '.cache'
+        cache.write_json(tables / 'experiment.json', asdict(experiment))
+        cache.write_json(tables / 'metric_protocol.json', cache.metric_protocol(experiment)[1])
+        pd.DataFrame([dict(dataset='toy', method='Bacteria-collapsed', real_discoveries=7)]).to_csv(
+            tables / 'full_metrics.csv', index=False)
+        (tables / 'artifacts.csv').write_text('prior validated stage references\n')
+        (output / experiment.outputs[0]).write_bytes(b'prior figure')
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in tables.iterdir()}
+        figure = output / experiment.outputs[0]
+        before[figure] = (figure.read_bytes(), figure.stat().st_mtime_ns)
+        with patch.object(pipeline, 'load', side_effect=[data, ValueError('Incompatible stage')]), \
+             patch.object(comparison, 'render', side_effect=AssertionError('Rendered partial results')):
+            failures = pipeline.run(experiment)
+        self.assertEqual(failures, [dict(dataset='missing', error='ValueError: Incompatible stage')])
+        self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before}, before)
+        self.assertFalse(list(output.glob('.tables_*')))
+        self.assertEqual(json.loads((tables / 'status.json').read_text())['state'], 'incomplete')
+
+    def test_render_failure_preserves_saved_results(self):
+        self.dataset()
+        experiment = Experiment('render_failure', ('toy',), (Bacteria(),), ('discoveries',),
+                                ('real_discoveries_overview.png',))
+        output = self.root / 'outputs/render_failure'
+        tables = output / '.cache'
+        cache.write_json(tables / 'experiment.json', asdict(experiment))
+        cache.write_json(tables / 'metric_protocol.json', cache.metric_protocol(experiment)[1])
+        pd.DataFrame([dict(dataset='toy', method='Bacteria-collapsed', real_discoveries=7)]).to_csv(
+            tables / 'full_metrics.csv', index=False)
+        (output / experiment.outputs[0]).write_bytes(b'prior figure')
+        paths = list(tables.iterdir()) + [output / experiment.outputs[0]]
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths}
+
+        def fail_render(definition, *, output):
+            (output / definition.outputs[0]).write_bytes(b'partial replacement')
+            raise RuntimeError('Figure save failed')
+
+        with patch.object(comparison, 'render', side_effect=fail_render):
+            with self.assertRaisesRegex(RuntimeError, 'Figure save failed'):
+                pipeline.run(experiment)
+        self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths}, before)
+        status = json.loads((tables / 'status.json').read_text())
+        self.assertEqual(status['stage'], 'reporting')
+        self.assertTrue(status['retained_previous_results'])
+        self.assertFalse(list(output.glob('.tables_*')))
+
+    def test_table_write_failure_records_status_and_preserves_results(self):
+        experiment = Experiment('disk_failure', ('toy',), (Bacteria(),), ('discoveries',),
+                                ('real_discoveries_overview.png',))
+        output = self.root / 'outputs/disk_failure'
+        tables = output / '.cache'
+        cache.write_json(tables / 'experiment.json', asdict(experiment))
+        cache.write_json(tables / 'metric_protocol.json', cache.metric_protocol(experiment)[1])
+        (tables / 'full_metrics.csv').write_text('prior validated table\n')
+        (output / experiment.outputs[0]).write_bytes(b'prior figure')
+        paths = list(tables.iterdir()) + [output / experiment.outputs[0]]
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths}
+        with patch.object(pipeline, 'run_tables', side_effect=OSError('disk full')), \
+             patch.object(comparison, 'render') as render:
+            with self.assertRaisesRegex(OSError, 'disk full'):
+                pipeline.run(experiment)
+            render.assert_not_called()
+        self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths}, before)
+        status = json.loads((tables / 'status.json').read_text())
+        self.assertEqual((status['state'], status['stage'], status['error']), ('failed', 'tables', 'OSError: disk full'))
+        self.assertTrue(status['retained_previous_results'])
+        self.assertFalse(list(output.glob('.tables_*')))
 
     def test_small_end_to_end_four_methods_cache_resumption_and_plot_only(self):
         self.dataset()

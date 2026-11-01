@@ -52,7 +52,7 @@ def cgroup_values():
         return {}
     root = Path('/sys/fs/cgroup')/relative.lstrip('/')
     result = {}
-    for name in ('memory.current', 'memory.peak', 'memory.max', 'memory.events', 'cpu.stat'):
+    for name in ('memory.current', 'memory.peak', 'memory.max', 'memory.swap.max', 'memory.events', 'cpu.stat'):
         try:
             result[name] = (root/name).read_text().strip()
         except (FileNotFoundError, PermissionError):
@@ -76,11 +76,13 @@ def main():
     if not logs.is_relative_to(PROJECT / 'outputs') or '.cache' not in logs.parts:
         parser.error('Logs must stay in a private project outputs/.cache directory')
     logs.mkdir(parents=True, exist_ok=True)
-    with (logs/f'{PREFIX}.lock').open('a') as lock:
+    lock_directory = STUDY_OUTPUT / 'logs'
+    lock_directory.mkdir(parents=True, exist_ok=True)
+    with (lock_directory/f'{PREFIX}.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         group = cgroup_values()
         limit = group.get('memory.max', 'max')
-        if limit == 'max' or int(limit) > LIMIT_BYTES:
+        if limit == 'max' or int(limit) > LIMIT_BYTES or group.get('memory.swap.max') != '0':
             raise RuntimeError('Launch in a user service with MemoryMax=200G and MemorySwapMax=0')
         env = os.environ.copy()
         env.update({n: '1' for n in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS', 'BLIS_NUM_THREADS')})

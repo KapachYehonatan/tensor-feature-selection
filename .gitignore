@@ -4,5 +4,6 @@ __pycache__/
 .pytest_cache/
 outputs/
 cache/
+datasets/cMD_downloads/
 logs/
 .ipynb_checkpoints/

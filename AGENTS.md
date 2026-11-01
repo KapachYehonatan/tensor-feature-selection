@@ -12,7 +12,8 @@ not permanent restrictions. Follow the user's current request over this file.
   research, plan, edit, test, and execute jobs directly.
 - When the user requests subagents, the following collaboration rules apply.
 - Canonical roles live in `.codex/agents/`: `scientific_researcher.toml`,
-  `scientific_critic.toml`, `research_planner.toml`, and `research_engineer.toml`.
+  `scientific_critic.toml`, `research_planner.toml`, `research_engineer.toml`,
+  and `code_reviewer.toml`.
   Use named agents when supported. With generic spawning, read the relevant TOML
   and pass its `developer_instructions` explicitly. Disclose unavailable
   delegation rather than pretending an independent review occurred.
@@ -24,12 +25,16 @@ not permanent restrictions. Follow the user's current request over this file.
 - Any agent may consult any other through messaging or the coordinator. Reuse
   threads; allow revisions and loops without a fixed sequence or round limit.
   Only the coordinator creates threads; specialists must not spawn agents.
+- The code reviewer may challenge engineering plans, designs, implementation
+  steps, or finished code from any agent. Use it when the authorized task needs
+  engineering review; it adds no mandatory review sequence or approval gate.
 - Preserve meaningful disagreements. Escalate decisions requiring user judgment,
   new authority, expanded scope, or discussion that stops making progress.
   Do not force consensus or manufacture objections.
-- Researcher, critic, and planner are read-only by instruction, not separate
-  security sandboxes. The engineer is the sole specialist editing files and
-  executing jobs. Briefly announce delegation and its purpose.
+- Researcher, scientific critic, planner, and code reviewer are read-only by
+  instruction, not separate security sandboxes. The engineer is the sole
+  specialist editing files and executing jobs. Briefly announce delegation and
+  its purpose.
 - End with the requested task. No autonomous follow-up experiment, permanent
   agent transcript, workflow engine, hooks, or persistent agent-memory system.
 
@@ -63,9 +68,10 @@ not permanent restrictions. Follow the user's current request over this file.
 - Read/save sparse matrices; never create the dense tensor or a complete
   gene-gene similarity matrix. In Bernoulli-join, thresholds determine clusters,
   not a requested cluster count; retain weakly similar features as singletons.
-- Treat `/home/kapachy/Microbium/projects/cMD_downloads` as read-only. Leave
-  external repositories and installed environments untouched. Preserve unrelated
-  working-tree changes.
+- Dataset sources live in `datasets/cMD_downloads/`; preserve supplied values
+  unless a dataset change is explicitly approved. Leave external repositories,
+  unrelated datasets/runs and installed environments untouched. Preserve
+  unrelated working-tree changes.
 - Inspect existing caches before recomputing. Keep strict input/settings/code
   signatures and original protocols; never bypass incompatibility or accidentally
   refit an expensive experiment to resolve a cache mismatch.

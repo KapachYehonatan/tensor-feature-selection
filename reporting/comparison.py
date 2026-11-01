@@ -57,9 +57,13 @@ def curves(ax, table, dataset, names, colors, ks, field, sd=None):
     ax.grid(alpha=.2)
 
 
-def render(experiment):
+def render(experiment, *, output=None):
+    """Render requested figures from compatible saved tables; never fit scientific models.
+
+    Optional output overrides the root for figures and .cache table reads/writes.
+    """
     validate(experiment)
-    output = PROJECT / "outputs" / experiment.name
+    output = PROJECT / "outputs" / experiment.name if output is None else Path(output)
     tables = output / ".cache"
     definition = tables / "experiment.json"
     if not definition.exists() or json.loads(definition.read_text()) != json.loads(json.dumps(asdict(experiment))):
@@ -82,6 +86,8 @@ def render(experiment):
         summary.to_csv(tables / "summary.csv", index=False)
     names = [m.name for m in experiment.methods]
     colors = {name: plt.get_cmap("tab10")(i % 10) for i, name in enumerate(names)}
+    colors.update({"Bacteria-collapsed": "tab:orange", "Gene-collapsed": "tab:green",
+                   "Bernoulli-join": "tab:blue"})
     fine, coarse = experiment.evaluation.fine_k, experiment.evaluation.coarse_k
     auc_limits = ((max(0, prediction.auroc_cv_mean.min() - .04), min(1, prediction.auroc_cv_mean.max() + .04))
                   if not prediction.empty else (0, 1))

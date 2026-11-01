@@ -2,10 +2,97 @@
 import numpy as np
 from scipy import sparse, stats
 from dataclasses import asdict, dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from methods.correction import BY
 from methods.selectors.correlation import greedy_filter
 
 MANN_WHITNEY_CHUNK = 2000
+SHUFFLE_WORKERS = 24
+
+
+@dataclass
+class PreparedMannWhitney:
+    ranks: sparse.csc_matrix
+    zero_ranks: np.ndarray
+    tie_terms: np.ndarray
+    workers: int
+
+    def test(self, targets):
+        targets = np.asarray(targets)
+        n, p = self.ranks.shape
+        if (targets.ndim != 2 or targets.shape[1] != n
+                or not np.isin(targets, [0, 1]).all()):
+            raise ValueError('Shuffle labels must be binary and match the prepared samples')
+        groups = (targets == 1).astype(np.float64)
+        n1 = groups.sum(axis=1)[:, None]
+        n0 = n - n1
+        if np.any((n1 == 0) | (n0 == 0)):
+            raise ValueError('Mann-Whitney requires both label groups')
+        result = np.empty((len(targets), p))
+
+        def calculate(bounds):
+            start, end = bounds
+            rank_sum = groups @ self.ranks[:, start:end]
+            rank_sum += n1 * self.zero_ranks[start:end]
+            u = rank_sum - n1 * (n1 + 1) / 2
+            variance = n1 * n0 / 12 * ((n + 1) - self.tie_terms[start:end] / (n * (n - 1)))
+            numerator = u - n1 * n0 / 2
+            numerator -= .5 * np.sign(numerator)
+            result[:, start:end] = np.clip(2 * stats.norm.sf(np.abs(numerator / np.sqrt(variance))), 0, 1)
+
+        width = max(MANN_WHITNEY_CHUNK, (p + self.workers - 1) // self.workers)
+        bounds = [(start, min(start + width, p)) for start in range(0, p, width)]
+        if self.workers == 1:
+            for block in bounds:
+                calculate(block)
+        else:
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                list(pool.map(calculate, bounds))
+        return result
+
+
+def prepare_mann_whitney(matrix, workers=SHUFFLE_WORKERS):
+    """Pool ranks once; implicit zeros share an offset, avoiding a dense rank matrix."""
+    if not isinstance(workers, int) or not 1 <= workers <= SHUFFLE_WORKERS:
+        raise ValueError('Use between one and 24 shared-memory Mann-Whitney workers')
+    matrix = sparse.csc_matrix(matrix, copy=True)
+    if matrix.dtype != np.float64:
+        raise ValueError('Prepared Mann-Whitney requires float64 predictors to preserve SciPy arithmetic')
+    matrix.sum_duplicates()
+    matrix.eliminate_zeros()
+    n, p = matrix.shape
+    if n < 2 or not np.isfinite(matrix.data).all() or np.any(matrix.data < 0):
+        raise ValueError('Prepared Mann-Whitney requires finite nonnegative values and at least two samples')
+    zero_ranks = (n - np.diff(matrix.indptr) + 1) / 2
+    rank_values = np.empty(matrix.nnz, dtype=np.float64)
+    tie_terms = np.empty(p)
+
+    def prepare(bounds):
+        start, end = bounds
+        values = matrix[:, start:end].toarray()
+        ranks = stats.rankdata(values, axis=0) - zero_ranks[start:end]
+        low, high = matrix.indptr[start], matrix.indptr[end]
+        columns = np.repeat(np.arange(end - start), np.diff(matrix.indptr[start:end + 1]))
+        rank_values[low:high] = ranks[matrix.indices[low:high], columns]
+        ordered = np.sort(values, axis=0)
+        boundaries = np.ones((n + 1, end - start), dtype=bool)
+        boundaries[1:n] = ordered[1:] != ordered[:-1]
+        feature, positions = np.nonzero(boundaries.T)
+        same = feature[1:] == feature[:-1]
+        lengths = np.diff(positions)[same].astype(np.float64)
+        tie_terms[start:end] = np.bincount(feature[:-1][same], lengths**3 - lengths, minlength=end - start)
+
+    bounds = [(start, min(start + MANN_WHITNEY_CHUNK, p)) for start in range(0, p, MANN_WHITNEY_CHUNK)]
+    if workers == 1:
+        for block in bounds:
+            prepare(block)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(prepare, bounds))
+    if np.any(tie_terms >= n**3 - n):
+        raise ValueError('Training-constant predictors must be excluded before Mann-Whitney shuffles')
+    ranks = sparse.csc_matrix((rank_values, matrix.indices, matrix.indptr), shape=matrix.shape)
+    return PreparedMannWhitney(ranks, zero_ranks, tie_terms, workers)
 
 
 @dataclass(frozen=True)

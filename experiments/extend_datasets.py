@@ -9,7 +9,7 @@ from datasets.acquire import prepare_all
 from execution import cache, pipeline
 
 THRESHOLDS = (.8, .7)
-FREE_DISK_GIB = 100
+FREE_DISK_GIB = 50
 PROJECT = Path(__file__).resolve().parents[1]
 ORIGINAL_RUN = subprocess.run
 
@@ -62,7 +62,7 @@ def run_locked(experiment):
 def main():
     cache.write_json(PROJECT / 'outputs/main_comparison/.cache/logs/extension/resource_override.json',
         dict(declared_free_disk_gib=500, effective_free_disk_gib=FREE_DISK_GIB,
-             approved='2026-10-29', reason='Operational disk reserve only; scientific settings and cache checks unchanged.'))
+             approved='2026-10-30', reason='Operational disk reserve only; scientific settings and cache checks unchanged.'))
     print(f'Graph/clustering free-disk reserve: {FREE_DISK_GIB} GiB; completed scientific caches remain compatible.', flush=True)
     failures = prepare_all()
     # Import definitions after preparation/queueing; existing workers keep their original definitions.

@@ -15,10 +15,10 @@ from datasets.catalog import NEW_DATASETS
 from datasets.loading import load
 from datasets.prepare import prepare, prepare_matrix, pair_mapping
 
-SOURCE = Path('/home/kapachy/Microbium/projects/cMD_downloads/multilabel')
+SOURCE = Path(__file__).with_name('cMD_downloads')
 R = Path('/home/kapachy/.venvs/taxsea-r/bin/Rscript')
 PARQUET_PYTHON = Path('/home/kapachy/miniforge3/envs/yamas_shotgun/bin/python')
-DOWNLOADS = cache.CACHE / 'downloads'
+DOWNLOADS = SOURCE / '.sources'
 CMD_FILES = 'https://raw.githubusercontent.com/waldronlab/curatedMetagenomicData/afd13adf72a4cda3c60ce60e7d5f20ef04bd5f8e/inst/extdata/metadata.csv'
 CMD_METADATA = 'https://raw.githubusercontent.com/waldronlab/curatedMetagenomicDataCuration/ffea85122e43c7c047451636f84dd823ba52c077/inst/extdata/sampleMetadata.csv'
 HUB = 'https://mghp.osn.xsede.org/bir190004-bucket01/ExperimentHub/'

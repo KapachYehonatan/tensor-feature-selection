@@ -5,6 +5,8 @@ from pathlib import Path
 import json
 import traceback
 import subprocess
+import tempfile
+import shutil
 from functools import lru_cache
 import numpy as np
 import pandas as pd
@@ -15,7 +17,9 @@ from execution import cache
 from methods import preprocessing as prep, representations as reps
 from methods.pipelines import construct
 from methods.graphs.bernoulli_join import JOIN_PROJECT
-from methods.selectors.mann_whitney import MannWhitney
+from methods.selectors.mann_whitney import (
+    MannWhitney, PreparedMannWhitney, prepare_mann_whitney, MANN_WHITNEY_CHUNK, SHUFFLE_WORKERS,
+)
 from metrics.prediction import predict_prefixes, predict_model, point_metrics, new_model, summarize
 from metrics.correlation import average_pairwise_absolute_correlation
 from metrics.shuffled_fdp import label_permutations, discovery_statistics
@@ -61,6 +65,10 @@ def contexts(y, evaluation):
 
 
 def prepare_family(data, context, preprocessing, method, notify=None):
+    """Fit/cache a method on context.training; return Family values for all samples.
+
+    Its sample-by-feature matrix uses training-defined groups and eligible columns.
+    """
     notify = notify or (lambda stage: None)
     fitting = cache.array_hash(context.training)
     key, record = cache.identity("preprocessing", dict(detection=cache.sparse_hash(data.values[context.training], values=False), fit=fitting),
@@ -91,6 +99,16 @@ def prepare_family(data, context, preprocessing, method, notify=None):
         notify("graph")
         print(f"{data.name}/{context.scope}: graph {'cached' if cached else 'building'}; log={graph / 'graph.log'}", flush=True)
         if not cached:
+            work = graph / "work"
+            manifest = work / "graph/run.json"
+            if (work.is_symlink() or (work / "graph").is_symlink() or manifest.is_symlink()
+                    or work.resolve().parent != graph.resolve()):
+                raise ValueError(f"Refusing to reset graph work outside its stage: {work}")
+            state = json.loads(manifest.read_text()) if manifest.exists() else {}
+            if state.get("status") == "aborted_resource_limit":
+                # Retain the failure reason without keeping a partial graph that consumes its retry's disk reserve.
+                cache.write_json(graph / "aborted_run.json", state)
+                shutil.rmtree(work)
             method.graph.build(data.path / "X_valid.npz", selection, graph / "work")
             cache.seal(graph, graph_key, [p for p in (graph / "work").rglob("*") if p.is_file()])
         partition_key, partition_record = cache.identity("clustering", dict(graph=graph_key),
@@ -180,6 +198,49 @@ def prediction(data, context, family, selected_key, selected, evaluation):
     return metrics, predictions, key
 
 
+def prepare_mw_shuffles(family, methods, targets, states, completed):
+    """Validate the optimized implementation separately from unchanged scientific protocols."""
+    signature, record = cache.identity('mw_shuffle_execution', dict(family=family.key),
+        dict(workers=SHUFFLE_WORKERS, chunk_size=MANN_WHITNEY_CHUNK, rank_dtype='float64',
+             reference='installed SciPy asymptotic two-sided MW'),
+        (PreparedMannWhitney, prepare_mann_whitney, prepare_mw_shuffles), software=('numpy', 'scipy'))
+    missing = []
+    for method, directory, key, values in states:
+        path = directory / 'mw_shuffle_execution.json'
+        if path.exists():
+            saved = json.loads(path.read_text())
+            if saved['signature'] != signature or saved['protocol'] != record or saved['scientific_signature'] != key:
+                raise ValueError(f'Changed Mann-Whitney shuffle implementation: {directory}')
+        elif directory not in completed:
+            missing.append((path, key, values))
+    if len(completed) == len(states):
+        return None
+    prepared = prepare_mann_whitney(family.values)
+    if missing:
+        indices = np.arange(min(3, len(targets)))
+        expected = methods[0].selector.batch_test(family.values, targets[indices])
+        actual = prepared.test(targets[indices])
+        np.testing.assert_array_equal(actual, expected)
+        for method, _, _, saved_counts in states:
+            for i, old, new in zip(indices, expected, actual):
+                arguments = (family.values, family.ids, family.original_size, 75)
+                reference = method.selector.select({'p': old}, *arguments)
+                result = method.selector.select({'p': new}, *arguments)
+                for field in ('order', 'native', 'q'):
+                    np.testing.assert_array_equal(result[field], reference[field])
+                if saved_counts[i] >= 0 and saved_counts[i] != len(reference['native']):
+                    raise ValueError('Saved shuffled discovery count disagrees with the SciPy replay')
+        for path, key, values in missing:
+            cache.write_json(path, dict(signature=signature, protocol=record, scientific_signature=key,
+                retained_shuffles=int(np.count_nonzero(values >= 0)), retained_counts_hash=cache.array_hash(values),
+                replay_indices=indices.tolist(), reference_p_hash=cache.array_hash(expected),
+                optimized_p_hash=cache.array_hash(actual), maximum_p_error=float(np.max(np.abs(actual - expected))) if actual.size else 0.,
+                p_values_order_and_discoveries_match=True))
+        print(f'Mann-Whitney: pooled ranks prepared once; up to {prepared.workers} shared-memory workers; '
+              f'{len(indices)} SciPy shuffle replays matched exactly.', flush=True)
+    return prepared
+
+
 def shuffled_counts(data, family, methods, evaluation):
     """One transient evidence batch per family; all cutoffs reuse each MW vector."""
     y = data.samples.y.to_numpy()
@@ -203,11 +264,14 @@ def shuffled_counts(data, family, methods, evaluation):
                 or np.any(values < -1) or np.any(values > size)):
             raise ValueError("Invalid shuffle checkpoint")
         states.append((method, directory, key, values))
+    selector = methods[0].selector
+    optimized_mw = type(selector) is MannWhitney and family.values.dtype == np.float64
+    prepared = prepare_mw_shuffles(family, methods, targets, states, completed) if optimized_mw else None
     if len(completed) == len(states):
         return ({method.name: values for method, _, _, values in states},
                 {method.name: key for method, _, key, _ in states})
-    selector = methods[0].selector
-    prepared = selector.prepare(family.values)
+    if not optimized_mw:
+        prepared = selector.prepare(family.values)
     baselines = {s[0].selector.correction: s for s in states if isinstance(s[0].selector, MannWhitney)
                  and s[0].selector.correlation_threshold is None}
     for left in range(0, evaluation.shuffles, 8):
@@ -221,7 +285,7 @@ def shuffled_counts(data, family, methods, evaluation):
             if any(s[3][i] < 0 for s in pending):
                 indices.append(i)
         if indices:
-            vectors = selector.batch_test(family.values, targets[indices], prepared)
+            vectors = prepared.test(targets[indices]) if optimized_mw else selector.batch_test(family.values, targets[indices], prepared)
             for i, vector in zip(indices, vectors):
                 evidence = {selector.kind: vector}
                 original_counts = {}
@@ -257,21 +321,56 @@ def shuffled_counts(data, family, methods, evaluation):
 
 
 def run(experiment):
-    from reporting.comparison import validate
+    """Execute an Experiment, publish complete exports, and return dataset failure records."""
+    from reporting.comparison import render, validate
     validate(experiment)
     output = cache.PROJECT / "outputs" / experiment.name
-    tables = output / ".cache"
-    tables.mkdir(parents=True, exist_ok=True)
-    # Existing figures retain their stated coverage until new results are rendered.
-    for name in ("fold_metrics.csv", "predictions.csv.gz", "prediction_summary.csv", "full_metrics.csv",
-                 "topk_correlations.csv", "p_value_comparison.csv", "summary.csv", "failures.csv", "artifacts.csv"):
-        path = tables / name
-        if path.exists():
-            path.unlink()
+    saved = output / ".cache"
+    saved.mkdir(parents=True, exist_ok=True)
+    retained = (saved / "experiment.json").exists()
+    # Failed resumptions must not replace earlier validated results with partial tables.
+    with tempfile.TemporaryDirectory(prefix=".tables_", dir=output) as temporary:
+        staged = Path(temporary)
+        tables = staged / ".cache"
+        phase = "tables"
+        try:
+            tables.mkdir()
+            failures = run_tables(experiment, tables)
+            if failures:
+                cache.write_json(saved / "status.json", dict(state="incomplete", stage="finished", failures=failures,
+                                                            retained_previous_results=retained))
+                return failures
+            phase = "reporting"
+            cache.write_json(saved / "status.json", dict(state="running", stage=phase))
+            render(experiment, output=staged)
+        except Exception as error:
+            cache.write_json(saved / "status.json", dict(state="failed", stage=phase,
+                error=f"{type(error).__name__}: {error}", retained_previous_results=retained))
+            raise
+        for name in ("fold_metrics.csv", "predictions.csv.gz", "prediction_summary.csv", "full_metrics.csv",
+                     "topk_correlations.csv", "p_value_comparison.csv", "summary.csv", "failures.csv", "artifacts.csv"):
+            if (tables / name).exists():
+                (tables / name).replace(saved / name)
+            elif (saved / name).exists():
+                (saved / name).unlink()
+        for name in experiment.outputs:
+            (staged / name).replace(output / name)
+        for name in ("experiment.json", "metric_protocol.json"):
+            (tables / name).replace(saved / name)
+    cache.write_json(saved / "status.json", dict(state="complete", stage="finished"))
+    return []
+
+
+def run_tables(experiment, tables):
+    """Write replacement tables to private Path tables; return dataset failure records.
+
+    Live status stays in the experiment's real cache while these tables are staged.
+    """
+    output = cache.PROJECT / "outputs" / experiment.name
     cache.write_json(tables / "experiment.json", asdict(experiment))
     cache.write_json(tables / "metric_protocol.json", cache.metric_protocol(experiment)[1])
     def status(stage, dataset=None, scope=None, method=None, state="running"):
-        cache.write_json(tables / "status.json", dict(state=state, dataset=dataset, scope=scope, method=method, stage=stage))
+        cache.write_json(output / ".cache/status.json", dict(state=state, dataset=dataset, scope=scope, method=method, stage=stage))
     fold_rows, oof_rows, full_rows, correlation_rows, failures, references = [], [], [], [], [], []
     for dataset in experiment.datasets:
         try:
@@ -343,8 +442,4 @@ def run(experiment):
     if fold_rows:
         summarize(pd.concat(fold_rows, ignore_index=True), pd.concat(oof_rows, ignore_index=True), experiment.evaluation).to_csv(
             tables / "prediction_summary.csv", index=False)
-    from reporting.comparison import render
-    status("reporting")
-    render(experiment)
-    status("finished", state="incomplete" if failures else "complete")
     return failures

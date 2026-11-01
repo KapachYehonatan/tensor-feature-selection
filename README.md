@@ -8,6 +8,7 @@ restriction on the research.
 ## Project structure
 
 - `datasets/`: dataset catalog, independent-participant loading and explicit sparse input export.
+  `datasets/cMD_downloads/<study>/` holds each study's four source files and is ignored by Git.
 - `methods/`: shared preprocessing, representations, corrections and compositional pipelines.
   `graphs/` builds exact Bernoulli edges; `clustering/` fits partitions from saved
   graphs; `selectors/` owns MW ranking, Pearson filtering and fixed three-bin e-values.
@@ -36,11 +37,15 @@ Prediction uses seed-42 five-fold CV, fine K=1–10 and coarse K={10,20,50,75},
 without tuning. Top-K rankings are unscreened; scaling and balanced L2 logistic
 regression C=1 are training-only. Mean-fold metrics/SD and pooled OOF metrics are
 saved separately. Full-dataset statistics never enter CV prediction.
+Here, unscreened means no significance cutoff; filtered join still applies its
+training-fitted Pearson cutoff to the predictive ranking.
 
 Baselines use MW/BY at .10 over complete eligible representation families.
 Bins e-value uses zero/low/high bins and fixed lambda=1, exact conditional
 normalization and native e-BH at .10 over the full supplied raw-pair catalog;
-excluded pairs have zero evidence. Predictive Top-K sets are not FDR certificates.
+the catalog is defined by the cohort input export, which omits pairs absent
+throughout that imported cohort. Pairs excluded later have zero evidence.
+Predictive Top-K sets are not FDR certificates.
 Filtered join compares each candidate with every accepted feature, then uses
 full-family masked-p BY for discoveries; prediction uses a separate unscreened ranking.
 
@@ -77,20 +82,30 @@ Strict signatures include actual stage inputs, settings, kernels and relevant
 software. Incompatible stages receive distinct keys; damaged checkpoints fail.
 Plotting/docs/tests do not invalidate scientific caches. Missing results are
 explicit and plotting cannot trigger computation.
+Runs stage tables and figures privately before replacing completed exports.
+Scientific or rendering failures retain prior tables, protocols and figures;
+live status records the failure. Failed first runs keep reusable stages without
+publishing partial reports. Explicit resource-aborted, unsealed graph work can
+be restarted after retaining its small abort manifest; completed stages stay strict.
 
 `experiments.extend_datasets` acquires the eight approved cohorts using pinned
 cMD/ASAP sources, exports unchanged sparse values into `cache/inputs/`, waits for
 active comparison jobs, then runs the expanded main comparison and correlation
 filters `.8 .7`. Downloads, checksums, import protocols and an accession-overlap
-audit stay in `cache/downloads/`. Converters use the installed base R and Arrow
+audit stay in `datasets/cMD_downloads/.sources/`. Converters use the installed base R and Arrow
 environments read-only. Launch through `execution.resources`, using
 `--log-directory outputs/main_comparison/.cache/logs/extension`. Existing scientific
 caches are reused; graph launches retain the RAM guard and use the approved
-100-GiB free-disk reserve, recorded separately from scientific cache protocols.
+50-GiB free-disk reserve, recorded separately from scientific cache protocols.
+Mann–Whitney shuffles reuse pooled ranks/tie corrections with up to 24
+shared-memory workers, each retaining one native numerical thread. The optimized
+path is fingerprinted separately and checked against SciPy before extending counts.
 
 ## Research agents
 
-`AGENTS.md` describes the four optional specialists in `.codex/agents/`:
-researcher, critic, planner and engineer. Use subagents when requested; the main
-chat coordinates flexible consultations. The planner specifies science/outputs,
-the engineer owns implementation, and scientific changes require user approval.
+`AGENTS.md` describes the five optional specialists in `.codex/agents/`:
+researcher, scientific critic, planner, engineer and code reviewer. Use subagents
+when requested; the main chat coordinates flexible consultations. The planner specifies science/outputs,
+the engineer owns implementation, and the code reviewer challenges engineering
+decisions for correctness, simplicity and scientific readability. Scientific
+changes require user approval.
