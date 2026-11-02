@@ -3,3 +3,5 @@ scipy
 pandas
 scikit-learn
 matplotlib
+numba==0.67.0
+igraph==1.0.0

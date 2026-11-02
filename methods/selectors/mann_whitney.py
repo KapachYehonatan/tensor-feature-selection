@@ -105,29 +105,43 @@ class MannWhitney:
         if self.correlation_threshold is not None and not 0 < self.correlation_threshold < 1:
             raise ValueError("Invalid Pearson threshold")
 
-    def test(self, matrix, y):
+    def test(self, matrix: sparse.spmatrix, y: np.ndarray) -> dict[str, np.ndarray]:
+        """Test sample×feature values against binary labels; return aligned p-values/effects."""
         p, effects = mann_whitney_many(matrix, [np.asarray(y)])
         return dict(p=p[0], effect=effects)
 
-    def batch_test(self, matrix, targets, prepared=None):
+    def batch_test(self, matrix: sparse.spmatrix, targets: np.ndarray,
+                   prepared: PreparedMannWhitney | None = None) -> np.ndarray:
+        """Map shuffle×sample labels to shuffle×feature p-values, reusing pooled ranks."""
+        if prepared is not None:
+            return prepared.test(targets)
         return np.asarray(mann_whitney_many(matrix, targets)[0])
 
-    def family_size(self, candidates, original):
+    def family_size(self, candidates: int, original: int) -> int:
+        """MW/BY tests the complete eligible represented-feature family."""
         return candidates
 
-    def prepare(self, matrix):
-        return None
+    def prepare(self, matrix: sparse.spmatrix) -> PreparedMannWhitney | None:
+        """Cache label-independent ranks once; other dtypes use the reference path."""
+        return prepare_mann_whitney(matrix) if matrix.dtype == np.float64 else None
 
     def test_settings(self):
         return {k: v for k, v in asdict(self).items() if k not in {"correction", "correlation_threshold"}}
 
     def dependencies(self):
-        return (type(self).test, type(self).batch_test, type(self).test_settings, mann_whitney_many)
+        return (type(self).test, type(self).batch_test, type(self).test_settings, type(self).prepare,
+                mann_whitney_many, prepare_mann_whitney, PreparedMannWhitney)
 
     def selection_dependencies(self):
         return (type(self).select, type(self).family_size, type(self.correction).adjust, greedy_filter)
 
-    def select(self, evidence, matrix, ids, family_size, rank_limit):
+    def select(self, evidence: dict, matrix: sparse.spmatrix, ids: np.ndarray,
+                family_size: int, rank_limit: int) -> dict[str, np.ndarray]:
+        """Return unscreened order, BY discoveries and q-values in matrix-column coordinates.
+
+        IDs break ranking ties. Optional filtering compares each candidate to
+        every accepted column; masked-p BY retains the complete tested family.
+        """
         p = evidence["p"]
         order = np.lexsort((ids, p))
         q = self.correction.adjust(p)

@@ -1,10 +1,14 @@
-"""Complete-discovery-set redundancy; no Top-K curve computation."""
+"""Exact pairwise redundancy for complete discovery sets or ranked Top-K subsets."""
 import numpy as np
+from scipy import sparse
 
 PAIRWISE_FEATURE_LIMIT = 10_000
 
-def average_pairwise_absolute_correlation(matrix, columns):
-    """Exact mean over distinct feature pairs; guard before any dense allocation."""
+def average_pairwise_absolute_correlation(matrix: sparse.spmatrix, columns: np.ndarray) -> dict:
+    """Evaluate selected columns of a sample×feature matrix; return value, size and status.
+
+    Exclude self-correlations. Check the feature-count guard before densifying.
+    """
     k = len(columns)
     result = dict(effective_k=k, pair_count=k*(k-1)//2,
                   average_pairwise_absolute_correlation=np.nan)

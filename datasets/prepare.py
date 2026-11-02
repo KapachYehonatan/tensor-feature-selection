@@ -6,12 +6,7 @@ import pandas as pd
 from scipy import sparse
 from scipy.io import mmread
 from execution import cache
-from datasets.loading import unique_day_zero_stool_mask
-
-
-def pair_dictionary(path):
-    with Path(path).open() as handle:
-        return pair_mapping(handle)
+from datasets.loading import unique_day_zero_stool_mask, validate
 
 
 def pair_mapping(names):
@@ -65,6 +60,8 @@ def prepare_matrix(name, raw, feature_names, sample_ids, metadata, *, source_stu
     feature_names = list(feature_names)
     if not sparse.issparse(raw) or raw.shape not in ((len(feature_names), len(sample_ids)), (len(sample_ids), len(feature_names))):
         raise ValueError("Sparse source dimensions do not match samples/features")
+    if raw.shape[0] == raw.shape[1]:
+        raise ValueError("Square source dimensions make sample/feature orientation ambiguous")
     sample_column = "sample_id" if "sample_id" in metadata else "SampleID"
     if metadata[sample_column].duplicated().any():
         raise ValueError("Duplicate source sample IDs")
@@ -99,6 +96,7 @@ def prepare_matrix(name, raw, feature_names, sample_ids, metadata, *, source_stu
     matrix, pb, pg = matrix[:, observed], pb[observed], pg[observed]
     if np.any(np.asarray(matrix.sum(axis=1)).ravel() <= 0):
         raise ValueError("An included sample has zero classified abundance")
+    validate(matrix, samples, pb, pg)
     output = cache.CACHE / "inputs" / name if destination is None else Path(destination)
     if output.exists() and any(output.iterdir()):
         raise ValueError("Refusing to overwrite an existing input export")

@@ -11,12 +11,13 @@ import json
 import tempfile
 import unittest
 import subprocess
+import sys
 import numpy as np
 import pandas as pd
 from scipy import sparse, stats
 from scipy.io import mmwrite
 from datasets.loading import load, validate
-from datasets.prepare import prepare
+from datasets.prepare import prepare, prepare_matrix
 from datasets import acquire
 from execution import cache, pipeline, resources
 from execution.spec import Experiment, Evaluation
@@ -24,7 +25,8 @@ from methods.preprocessing import Preprocessing, retained_pair_values
 from methods.pipelines import Bacteria, Gene, BernoulliJoin, BinsEValue, construct
 from methods.graphs.bernoulli_join import BernoulliGraph
 from methods.clustering.leiden import Leiden
-from methods.graphs import worker
+from methods.graphs import preparation as graph_preparation
+from methods.clustering import partition
 from methods.selectors import bins
 from methods.selectors.mann_whitney import MannWhitney, mann_whitney_many, prepare_mann_whitney
 from methods.selectors.correlation import greedy_filter
@@ -80,17 +82,10 @@ class ExperimentTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.patches = []
         for module, name, value in ((cache, "PROJECT", self.root), (cache, "CACHE", self.root / "cache"),
-                                    (comparison, "PROJECT", self.root), (pipeline, "JOIN_PROJECT", self.root / "external")):
+                                    (comparison, "PROJECT", self.root)):
             p = patch.object(module, name, value)
             p.start()
             self.addCleanup(p.stop)
-        self.external = self.root / "external"
-        self.external.mkdir()
-        for name in ("bernoulli_join.py", "community_detection.py"):
-            (self.external / name).write_text("# fixture")
-        p = patch.object(pipeline, "external_versions", return_value={"python": "fixture", "numpy": "fixture", "igraph": "fixture"})
-        p.start()
-        self.addCleanup(p.stop)
         TinyGraph.calls = TinyLeiden.calls = FixedP.calls = 0
 
     def dataset(self):
@@ -225,6 +220,8 @@ class ExperimentTests(unittest.TestCase):
             result = load('YachidaS_2019')
             np.testing.assert_array_equal(result.values.toarray(), values[:2].T)
             folder = cache.CACHE / 'inputs/YachidaS_2019'
+            with patch('datasets.prepare.mmread', side_effect=AssertionError('Reimported completed cohort')):
+                acquire.prepare_one('YachidaS_2019', pd.DataFrame(), pd.DataFrame())
             protocol = json.loads((folder / 'protocol.json').read_text())
             protocol['code']['datasets.acquire.read_sparse_rds'] = 'unused old converter'
             protocol['files'][str(Path(acquire.__file__).with_name('read_cmd.R'))] = 'unused old reader'
@@ -232,8 +229,9 @@ class ExperimentTests(unittest.TestCase):
             cache.write_json(folder / 'protocol.json', protocol)
             cache.seal(folder, old_key, [p for p in folder.iterdir() if p.name != 'complete.json'])
             with patch('datasets.prepare.mmread', side_effect=AssertionError('Reimported completed cohort')):
-                acquire.prepare_one('YachidaS_2019', pd.DataFrame(), pd.DataFrame())
-            self.assertEqual(json.loads((folder / 'compatibility.json').read_text())['original_signature'], old_key)
+                with self.assertRaisesRegex(ValueError, 'incompatible'):
+                    acquire.prepare_one('YachidaS_2019', pd.DataFrame(), pd.DataFrame())
+            self.assertFalse((folder / 'compatibility.json').exists())
             damaged = dict(protocol, settings=dict(protocol['settings'], positive='changed target'))
             cache.write_json(folder / 'protocol.json', damaged)
             with self.assertRaisesRegex(ValueError, 'incompatible'):
@@ -340,8 +338,6 @@ assert sparse.load_npz(p/'values.npz').toarray().tolist()==[[.01,0],[0,.02]]
         evaluation = Evaluation(folds=2, fine_k=(1,), coarse_k=(1,), shuffles=5)
         expected, keys = pipeline.shuffled_counts(data, family, [method], evaluation)
         directory = cache.CACHE / 'stages/toy/full/shuffles' / keys[method.name]
-        sidecar = directory / 'mw_shuffle_execution.json'
-        self.assertTrue(json.loads(sidecar.read_text())['p_values_order_and_discoveries_match'])
         (directory / 'complete.json').unlink()
         (directory / 'counts.npy').unlink()
         partial = expected[method.name].copy()
@@ -354,10 +350,11 @@ assert sparse.load_npz(p/'values.npz').toarray().tolist()==[[.01,0],[0,.02]]
         with patch('methods.selectors.mann_whitney.ThreadPoolExecutor', side_effect=AssertionError('Recomputed completed shuffles')):
             pipeline.shuffled_counts(data, family, [method], evaluation)
         self.assertEqual((directory / 'counts.npy').stat().st_mtime_ns, before)
-        changed = json.loads(sidecar.read_text())
-        changed['signature'] = 'changed'
-        cache.write_json(sidecar, changed)
-        with self.assertRaisesRegex(ValueError, 'Changed Mann-Whitney shuffle implementation'):
+        protocol = directory / 'protocol.json'
+        changed = json.loads(protocol.read_text())
+        changed['settings']['budget'] = 999
+        cache.write_json(protocol, changed)
+        with self.assertRaisesRegex(ValueError, 'Changed stage protocol'):
             pipeline.shuffled_counts(data, family, [method], evaluation)
 
     def test_exact_bins_full_catalog_and_native_ties(self):
@@ -389,6 +386,11 @@ assert sparse.load_npz(p/'values.npz').toarray().tolist()==[[.01,0],[0,.02]]
         self.assertNotEqual(first.references["clustering"], third.references["clustering"])
         self.assertEqual(TinyGraph.calls, 1)
         self.assertEqual(TinyLeiden.calls, 3)
+        smaller_cap = pipeline.prepare_family(data, context, Preprocessing(),
+            replace(original, graph=replace(original.graph, edge_limit=100, step=.01)))
+        self.assertEqual(first.references['graph'], smaller_cap.references['graph'])
+        self.assertNotEqual(first.references['clustering'], smaller_cap.references['clustering'])
+        self.assertEqual(TinyGraph.calls, 1)
 
     def test_shuffles_alpha_guard_shared_batches_and_immutable_resumption(self):
         data = self.dataset()
@@ -425,33 +427,288 @@ assert sparse.load_npz(p/'values.npz').toarray().tolist()==[[.01,0],[0,.02]]
         self.assertEqual(average_pairwise_absolute_correlation(None, [])["status"], "undefined_subset_size")
         self.assertEqual(average_pairwise_absolute_correlation(None, range(10001))["status"], "skipped_size_limit")
 
-    def test_extension_disk_override_preserves_scientific_settings(self):
-        from experiments import extend_datasets as extension
-        graph = BernoulliGraph()
-        before = dict(graph.__dict__)
-        for mode in ('graph', 'cluster'):
-            command = graph.command('matrix.npz', 'selection.npz', 'work') + ['--mode', mode]
-            expected = command.copy()
-            expected[expected.index('--free-disk-gb') + 1] = '50'
-            with patch.object(extension.Path, 'read_text', return_value='MemAvailable: 200000000 kB'), \
-                    patch.object(extension.shutil, 'disk_usage') as disk, \
-                    patch.object(extension, 'ORIGINAL_RUN') as run, \
-                    patch.object(extension.time, 'sleep', side_effect=AssertionError('Unnecessary wait')):
-                disk.return_value.free = 150 * 1024**3
-                extension.graph_run(command, check=True)
-                run.assert_called_once_with(expected, check=True)
-            self.assertEqual(command[command.index('--free-disk-gb') + 1], '500')
-        self.assertEqual(graph.__dict__, before)
+    def test_graph_disk_reserve_is_explicit_and_matches_experiment_definitions(self):
+        from experiments.main_comparison import EXPERIMENT
+        from experiments.join_correlation_filter import experiment
+        self.assertEqual(BernoulliGraph().free_disk_gib, 50)
+        for definition in (EXPERIMENT, experiment([.8])):
+            for method in definition.methods:
+                if method.graph is not None:
+                    self.assertEqual(method.graph.free_disk_gib, 50)
+
+    def test_input_export_rejects_ambiguous_axes_and_missing_participants_before_writing(self):
+        metadata = pd.DataFrame(dict(sample_id=['a', 'b', 'c'], subject_id=['p0', None, 'p2'],
+                                     target=['no', 'yes', 'no']))
+        arguments = dict(source_study='fixture', target_column='target', negative_label='no', positive_label='yes')
+        destination = self.root / 'invalid_export'
+        with self.assertRaisesRegex(ValueError, 'orientation ambiguous'):
+            prepare_matrix('square', sparse.csr_matrix(np.ones((3, 3))), ['g0|b0', 'g1|b1', 'g2|b2'],
+                           ['a', 'b', 'c'], metadata, destination=destination, **arguments)
+        with self.assertRaisesRegex(ValueError, 'independent participants'):
+            prepare_matrix('missing', sparse.csr_matrix(np.ones((2, 3))), ['g0|b0', 'g1|b1'],
+                           ['a', 'b', 'c'], metadata, destination=destination, **arguments)
+        self.assertFalse(destination.exists())
 
     def test_graph_guards_and_float32_boundary(self):
-        self.assertEqual(worker.fallback_thresholds(.7), [.7, .75, .8, .85, .9, .95, 1.])
-        self.assertEqual(worker.choose_effective_threshold({.7: 501, .75: 500}, 500), .75)
+        self.assertEqual(partition.fallback_thresholds(.7), [.7, .75, .8, .85, .9, .95, 1.])
+        self.assertEqual(partition.choose_effective_threshold({.7: 501, .75: 500}, 500), .75)
         shard = np.array([(np.float32(.8),), (np.float32(.79),)], dtype=[("phi", "f4")])
-        counts = worker.count_threshold_edges(None, [.8], {"edge_weight": {"field": "phi", "transform": "abs"}}, lambda _: [shard])
+        counts = graph_preparation.count_threshold_edges(None, [.8], {"edge_weight": {"field": "phi", "transform": "abs"}}, lambda _: [shard])
         self.assertEqual(counts[.8], 1)
         with self.assertRaises(RuntimeError):
-            worker.choose_effective_threshold({1.: 501}, 500)
-        np.testing.assert_array_equal(worker.stable_cluster_labels([0, 1], [0, -1], [2, 4], 4), [0, 1])
+            partition.choose_effective_threshold({1.: 501}, 500)
+        np.testing.assert_array_equal(partition.stable_cluster_labels([0, 1], [0, -1], [2, 4], 4), [0, 1])
+        self.assertEqual(partition.fallback_thresholds(.735, .07), [.735, .77, .84, .91, .98, 1.])
+        self.assertEqual(partition.fallback_thresholds(.9985, .001), [.9985, .999, 1.])
+        ids, labels = np.array([8, 2, 9, 1]), np.array([20, 4, 20, 7])
+        np.testing.assert_array_equal(partition.stable_cluster_labels(ids, labels, np.ones(4), 8), [2, 1, 2, 0])
+
+    def test_partition_retries_only_memory_failures_on_the_same_source(self):
+        from methods.clustering import community
+        args = SimpleNamespace(output=self.root / 'partition', threshold=.7, threshold_step=.05,
+            fixed_threshold=False, community_working_memory_gb=1, community_max_edges=1000,
+            community_workers=1, seed=17729, resolution=1, memory_gb=1, output_gb=1,
+            free_disk_gb=0, iterations=-1)
+        source, filtered = self.root / 'source', self.root / 'higher_threshold'
+        manifest = dict(threshold=.7, edge_count=1)
+        fitted = (np.array([0]), np.array([0]), {'status': 'complete'})
+        with patch.object(community, 'run_community_detection', side_effect=[MemoryError('fixture'), fitted]) as fit, \
+             patch.object(partition, 'count_threshold_edges', return_value={.7: 1, .75: 1}), \
+             patch.object(partition, 'threshold_graph', return_value=filtered) as materialize:
+            _, _, result = partition.fit_partition(args, source, manifest)
+        self.assertEqual([call.args[0] for call in fit.call_args_list], [source, filtered])
+        self.assertEqual(materialize.call_args.args, (args, source, manifest, .75, 1))
+        self.assertEqual(result['effective_threshold'], .75)
+        self.assertEqual(len(result['resource_retries']), 1)
+        with patch.object(community, 'run_community_detection', side_effect=RuntimeError('bad graph')), \
+             patch.object(partition, 'threshold_graph') as materialize:
+            with self.assertRaisesRegex(RuntimeError, 'bad graph'):
+                partition.fit_partition(args, source, manifest)
+            materialize.assert_not_called()
+        args.fixed_threshold = True
+        with patch.object(community, 'run_community_detection', side_effect=MemoryError('fixture')):
+            with self.assertRaisesRegex(RuntimeError, 'Fixed-threshold Leiden'):
+                partition.fit_partition(args, source, manifest)
+
+    def test_invalid_new_shuffle_counts_cannot_be_published_complete(self):
+        @dataclass(frozen=True)
+        class InvalidSelector(FixedP):
+            def select(self, *args):
+                return {'native': np.array([0, 0])}
+        data = self.dataset()
+        family = pipeline.Family('fixture', self.root, data.values[:, 1:2], np.array([1]), 4, {})
+        method = BernoulliJoin(selector=InvalidSelector())
+        evaluation = Evaluation(folds=2, fine_k=(1,), coarse_k=(1,), shuffles=2)
+        with self.assertRaisesRegex(ValueError, 'invalid shuffled counts'):
+            pipeline.shuffled_counts(data, family, [method], evaluation)
+        stages = list((cache.CACHE / 'stages/toy/full/shuffles').iterdir())
+        self.assertTrue(stages)
+        self.assertTrue(all(not (stage / 'complete.json').exists() for stage in stages))
+
+    def test_local_exact_worker_signed_edges_and_leiden(self):
+        from methods.graphs.exact import iter_edge_shards, run_join
+        values = np.array([[1, 1, 0, 1, 1], [1, 1, 0, 1, 0], [1, 1, 0, 1, 0], [1, 1, 0, 1, 0],
+                           [0, 0, 1, 1, 0], [0, 0, 1, 1, 0], [0, 0, 1, 1, 0], [0, 0, 1, 1, 0]], float)
+        ids = np.array([40, 10, 30, 20, 50])
+        matrix, selection = self.root / "worker_matrix.npz", self.root / "worker_selection.npz"
+        sparse.save_npz(matrix, sparse.csr_matrix(values))
+        np.savez(selection, train_index=np.arange(8), feature_ids=np.arange(5))
+        expected = {(0, 1): 1., (0, 2): -1., (1, 2): -1.}
+        for workers in (1, 4):
+            graph = BernoulliGraph(workers=workers, memory_gib=1, working_memory_gib=.1,
+                                  reserve_gib=0, free_disk_gib=0, output_gib=.1)
+            directory = self.root / f"actual_graph_{workers}"
+            self.assertEqual(graph.command(matrix, selection, directory)[:4],
+                             [sys.executable, "-u", "-m", "methods.graphs.worker"])
+            graph.build(matrix, selection, directory)
+            edges = {(int(e['feature_j']), int(e['feature_k'])): float(e['phi'])
+                     for shard in iter_edge_shards(directory / 'graph') for e in shard}
+            self.assertEqual(edges, expected)
+            mtimes = {p: p.stat().st_mtime_ns for p in directory.rglob('*') if p.is_file()}
+            output = self.root / f"actual_partition_{workers}"
+            Leiden(working_memory_gib=1).fit(directory, matrix, selection, output, graph)
+            with np.load(output / 'assignments.npz') as saved:
+                np.testing.assert_array_equal(saved['clusters'], [0, 0, 0, 1, 2])
+            self.assertEqual(mtimes, {p: p.stat().st_mtime_ns for p in mtimes})
+        packed = self.root / 'packed_failure'
+        graph_preparation.pack_sparse_detection(sparse.csr_matrix(values), ids, packed)
+        failed = run_join(packed, self.root / 'aborted', .7, memory_limit_gib=1,
+                          output_limit_gib=1e-8, free_disk_reserve_gib=0, workers=1, quiet=True)
+        self.assertEqual(failed['status'], 'aborted_resource_limit')
+        numpy_settings = run_join(packed, self.root / 'numpy_settings', np.float32(.7),
+            memory_limit_gib=np.float64(1), working_memory_gib=np.float32(.1), output_limit_gib=np.float32(.1),
+            free_disk_reserve_gib=np.float32(0), workers=np.int64(1), min_one_support=np.int64(1), quiet=True)
+        self.assertEqual(numpy_settings['status'], 'complete')
+        json.dumps(numpy_settings)  # Metadata remains serializable without a global NumPy encoder.
+
+    def test_partition_seeds_do_not_depend_on_shard_order(self):
+        from methods.graphs.exact import NODE_DTYPE, EDGE_DTYPE
+        from methods.clustering import community
+        memberships, seeds = [], []
+        for reverse in (False, True):
+            graph = self.root / f'order_{reverse}'
+            (graph / 'edges').mkdir(parents=True)
+            nodes = np.zeros(4, dtype=NODE_DTYPE)
+            nodes['feature_id'], nodes['eligible'] = [90, 5, 60, 2], True
+            np.save(graph / 'nodes.npy', nodes)
+            pairs = [(5, 90, 1.), (2, 60, 1.)]
+            for i, edge in enumerate(pairs[::-1] if reverse else pairs):
+                np.save(graph / 'edges' / f'part-{i:06d}.npy', np.array([edge], dtype=EDGE_DTYPE))
+            cache.write_json(graph / 'run.json', dict(status='complete', edge_count=2,
+                edge_weight=dict(field='phi', transform='abs')))
+            seen = {}
+            original = community._leiden_component
+            def record(task):
+                seen[int(nodes['feature_id'][np.unique(np.r_[task[1], task[2]])].min())] = task[0]
+                return original(task)
+            with patch.object(community, '_leiden_component', side_effect=record):
+                row_ids, membership, _ = community.run_community_detection(graph, output_dir=graph / 'partition',
+                    memory_limit_gib=1, working_memory_gib=1, free_disk_reserve_gib=0, quiet=True)
+            np.testing.assert_array_equal(row_ids, nodes['feature_id'])
+            memberships.append(membership)
+            seeds.append(seen)
+        np.testing.assert_array_equal(*memberships)
+        self.assertEqual(seeds, [{2: 0, 5: 1}] * 2)
+
+    def test_concurrent_shard_flushes_share_one_disk_reserve(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        import time
+        from methods.graphs import exact
+        from methods.graphs.resources import ResourceLimit
+        guard, start = threading.Lock(), threading.Barrier(4)
+        class NearReserve:
+            output_limit_bytes = 1024**3
+            free = 400
+            def check_memory(self, *args):
+                pass
+            def check_output(self, extra, label):
+                with guard:
+                    if extra > self.free:
+                        raise ResourceLimit('near reserve')
+                time.sleep(.01)  # Exposes a check/write race if the writer lock is missing.
+        monitor = NearReserve()
+        output = self.root / 'concurrent_writer'
+        output.mkdir()
+        writer = exact.EdgeWriter(output, monitor, np.zeros(2, dtype=exact.NODE_DTYPE))
+        real_save = np.save
+        def save(handle, values, **kwargs):
+            real_save(handle, values, **kwargs)
+            with guard:
+                monitor.free -= handle.tell()
+        def flush(_):
+            start.wait()
+            try:
+                writer._flush_state(dict(buffer=np.zeros(3, dtype=exact.EDGE_DTYPE), used=3))
+                return True
+            except ResourceLimit:
+                return False
+        with patch.object(exact.np, 'save', side_effect=save), ThreadPoolExecutor(4) as pool:
+            written = list(pool.map(flush, range(4)))
+        self.assertEqual(sum(written), 1)
+        self.assertEqual(writer.edge_count, 3)
+        self.assertGreaterEqual(monitor.free, 0)
+
+    def test_empty_constant_graph_keeps_singletons_and_guards_assignment_output(self):
+        from methods.graphs.resources import ResourceLimit
+        matrix, selection = self.root / 'constant.npz', self.root / 'constant_selection.npz'
+        sparse.save_npz(matrix, sparse.csr_matrix(np.ones((8, 3))))
+        np.savez(selection, train_index=np.arange(8), feature_ids=np.arange(3))
+        graph = BernoulliGraph(workers=1, memory_gib=1, working_memory_gib=.1,
+                              reserve_gib=0, free_disk_gib=0, output_gib=.1)
+        source, output = self.root / 'constant_graph', self.root / 'constant_partition'
+        graph.build(matrix, selection, source)
+        Leiden(working_memory_gib=1).fit(source, matrix, selection, output, graph)
+        with np.load(output / 'assignments.npz') as saved:
+            np.testing.assert_array_equal(saved['clusters'], [0, 1, 2])
+            np.testing.assert_array_equal(saved['cluster_sizes'], [1, 1, 1])
+        self.assertFalse(list(output.rglob('*.csv*')))
+        self.assertFalse((source / 'graph/timings.jsonl').exists())
+        args = SimpleNamespace(output=self.root / 'too_small', graph_source=source,
+                               memory_gb=1, output_gb=1e-8, free_disk_gb=0)
+        fitted = np.arange(3), np.full(3, -1), {}
+        with patch.object(partition, 'fit_partition', return_value=fitted):
+            with self.assertRaises(ResourceLimit):
+                partition.cluster_graph(args, np.arange(8), np.arange(3))
+        self.assertFalse((args.output / 'assignments.npz').exists())
+        with self.assertRaisesRegex(RuntimeError, 'original feature IDs'):
+            partition.write_assignments(output, np.arange(3), np.full(3, 8), 8,
+                                        np.array([0, 1, 5]), np.arange(3))
+
+    def test_bounded_batches_and_small_shards_match_dense_signed_oracle(self):
+        from methods.graphs import exact
+        rng = np.random.default_rng(33)
+        base = (rng.random(129) < .5).astype(np.int8)
+        values = np.tile(base[:, None], (1, 40))
+        values[:, 10:20] = 1 - values[:, 10:20]
+        for j in range(20, 40):
+            values[rng.choice(129, 3, replace=False), j] ^= 1
+        ids = rng.permutation(40)
+        packed = self.root / 'bounded_packed'
+        graph_preparation.pack_sparse_detection(sparse.csr_matrix(values), ids, packed)
+        correlations = np.corrcoef(values, rowvar=False)
+        expected = {tuple(sorted((int(ids[j]), int(ids[k])))): correlations[j, k]
+                    for j in range(40) for k in range(j + 1, 40) if abs(correlations[j, k]) >= .7}
+        for workers in (1, 4):
+            graph = self.root / f'bounded_{workers}'
+            with patch.object(exact, 'DEFAULT_BUFFER_BYTES', 84), patch.object(exact, 'GROUP_BATCH_SIZE', 11):
+                result = exact.run_join(packed, graph, .7, workers=workers, memory_limit_gib=1,
+                    working_memory_gib=.1, output_limit_gib=.1, free_disk_reserve_gib=0, quiet=True)
+            self.assertEqual(result['status'], 'complete')
+            self.assertGreater(result['edge_shards'], 1)
+            actual = {(int(e['feature_j']), int(e['feature_k'])): float(e['phi'])
+                      for shard in exact.iter_edge_shards(graph) for e in shard}
+            self.assertEqual(set(actual), set(expected))
+            for pair in expected:
+                self.assertAlmostEqual(actual[pair], expected[pair], places=6)
+
+    def test_exact_signed_phi_matches_brute_force_across_words_and_workers(self):
+        from methods.graphs.exact import iter_edge_shards, run_join
+        rng = np.random.default_rng(42)
+        values = (rng.random((70, 24)) < rng.uniform(.1, .9, 24)).astype(np.int8)
+        values[:, 1], values[:, 2] = values[:, 0], 1 - values[:, 0]
+        values[:, 3] = values[:, 0]
+        values[[2, 11, 35], 3] ^= 1
+        values[:, -1] = 1
+        ids = rng.permutation(24) + 100
+        packed = self.root / 'packed_oracle'
+        graph_preparation.pack_sparse_detection(sparse.csr_matrix(values), ids, packed)
+        correlations = np.corrcoef(values[:, :-1], rowvar=False)
+        self.assertTrue(np.any((np.abs(correlations) > .85) & (np.abs(correlations) < .999)))
+        for threshold, workers in itertools.product((.6, .85), (1, 4)):
+            graph = self.root / f'oracle_{threshold}_{workers}'
+            result = run_join(packed, graph, threshold, workers=workers, memory_limit_gib=1,
+                              working_memory_gib=.1, output_limit_gib=.1, free_disk_reserve_gib=0, quiet=True)
+            self.assertEqual(result['status'], 'complete')
+            actual = {(int(e['feature_j']), int(e['feature_k'])): float(e['phi'])
+                      for shard in iter_edge_shards(graph) for e in shard}
+            expected = {tuple(sorted((int(ids[j]), int(ids[k])))): correlations[j, k]
+                        for j in range(23) for k in range(j + 1, 23) if abs(correlations[j, k]) >= threshold}
+            self.assertEqual(set(actual), set(expected))
+            for pair in actual:
+                self.assertAlmostEqual(actual[pair], expected[pair], places=6)
+
+    def test_shared_pipeline_lock_rejects_another_writer_and_releases_on_failure(self):
+        cache.CACHE.mkdir(parents=True)
+        with (cache.CACHE / '.pipeline.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, 'Another scientific experiment'):
+                pipeline.run(None)
+        with patch.object(pipeline, '_run', side_effect=ValueError('fixture failure')):
+            with self.assertRaisesRegex(ValueError, 'fixture failure'):
+                pipeline.run(None)
+        with patch.object(pipeline, '_run', return_value=[]):
+            self.assertEqual(pipeline.run(None), [])
+
+    def test_bins_calibration_is_reused_across_shuffle_batches(self):
+        x = sparse.csr_matrix([[0, 1], [0, 1], [1, 2], [2, 3], [4, 4], [8, 5.]])
+        target = np.array([[0, 0, 0, 1, 1, 1]])
+        prepared = bins.prepare_bins(x)
+        expected = bins.evidence(prepared, target)
+        with patch.object(bins, 'normalizer', side_effect=AssertionError('Recomputed invariant normalizers')):
+            np.testing.assert_array_equal(bins.evidence(prepared, target), expected)
+        with self.assertRaisesRegex(ValueError, 'unchanged label-group'):
+            bins.evidence(prepared, np.array([[0, 0, 1, 1, 1, 1]]))
 
     def test_graph_resumes_only_explicit_unsealed_resource_abort(self):
         @dataclass(frozen=True)

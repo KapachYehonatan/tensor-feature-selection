@@ -4,7 +4,8 @@ import numpy as np
 from scipy import stats
 
 
-def label_permutations(y, key, count, seed=42):
+def label_permutations(y: np.ndarray, key: str, count: int, seed: int = 42) -> np.ndarray:
+    """Return shuffle×participant labels, preserving the observed class counts."""
     y = np.asarray(y, dtype=np.int8)
     if count < 1 or set(np.unique(y)) != {0, 1}:
         raise ValueError("Shuffles require a positive budget and two classes")
@@ -13,7 +14,12 @@ def label_permutations(y, key, count, seed=42):
     return np.stack([rng.permutation(y) for _ in range(count)])
 
 
-def discovery_statistics(counts, real, family_size):
+def discovery_statistics(counts: np.ndarray, real: int, family_size: int) -> dict:
+    """Compare one observed discovery count with a complete vector of shuffled counts.
+
+    The permutation p-value counts ties and includes the observed labeling.
+    The Normal reference uses a separate, model-dependent variance assumption.
+    """
     values = np.asarray(counts, dtype=float)
     if (values.ndim != 1 or not len(values) or not np.isfinite(values).all()
             or not np.isfinite(real) or not np.isfinite(family_size)

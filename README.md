@@ -12,11 +12,19 @@ restriction on the research.
 - `methods/`: shared preprocessing, representations, corrections and compositional pipelines.
   `graphs/` builds exact Bernoulli edges; `clustering/` fits partitions from saved
   graphs; `selectors/` owns MW ranking, Pearson filtering and fixed three-bin e-values.
+  Exact kernels/packing/filtering live under `graphs/`; component preparation,
+  Leiden and assignment export live under `clustering/`. The graph worker only
+  validates subprocess arguments and dispatches those stages.
 - `metrics/`: prediction, pairwise correlation and the Shuffled FDP test.
 - `execution/`: shared CV/full-data execution, strict stage caches and resource supervision.
 - `reporting/`: plots saved tables only; never fits scientific models.
 - `experiments/`: short Python definitions of datasets, methods, metrics and outputs.
 - `tests/test_experiment.py`: small scientific and cache-integrity fixtures.
+
+Read execution through `run_tables` → `run_cv` / `run_full_statistics` in
+`execution/pipeline.py`. Plotting has separate builders for AUROC, join-filter
+and statistical figures. Clustering separates resource-limited fitting from
+assignment restoration/export. Function contracts describe matrix axes and IDs.
 
 The two current experiments are `main_comparison` (Bacteria-collapsed,
 Gene-collapsed, Bernoulli-join and Bins e-value across sixteen datasets) and
@@ -58,7 +66,9 @@ above 10,000. These previously explored cohorts remain exploratory evidence.
 
 Graphs start at absolute phi .70, increasing by .05 only for resource guards;
 retain the 500-million-edge limit and ordinary Leiden convergence, resolution1,
-seed17729. External data and the sibling Bernoulli-join environment are read-only.
+seed17729. Graphs and Leiden use project-local source and the project interpreter;
+install `requirements.txt` (including Numba and igraph). The sibling Bernoulli-join
+repository/environment is no longer a runtime dependency and remains untouched.
 
 ## Running and outputs
 
@@ -80,13 +90,19 @@ stage references are private in each experiment's `.cache/`. Unfiltered inputs
 live in `cache/inputs/`; expensive reusable stages live in `cache/stages/`.
 Strict signatures include actual stage inputs, settings, kernels and relevant
 software. Incompatible stages receive distinct keys; damaged checkpoints fail.
-Plotting/docs/tests do not invalidate scientific caches. Missing results are
+The integrated kernels and deterministic component numbering invalidate old graph
+and partition signatures; no historical compatibility bypass is provided.
+Plot styling, standalone documentation and tests do not invalidate scientific
+caches. Edits to fingerprinted scientific functions, including signatures and
+docstrings, receive new keys. Missing results are
 explicit and plotting cannot trigger computation.
 Runs stage tables and figures privately before replacing completed exports.
 Scientific or rendering failures retain prior tables, protocols and figures;
 live status records the failure. Failed first runs keep reusable stages without
 publishing partial reports. Explicit resource-aborted, unsealed graph work can
 be restarted after retaining its small abort manifest; completed stages stay strict.
+Only one scientific experiment may write shared stage caches at a time; another
+run fails clearly rather than racing the active writer. Plot-only needs no run lock.
 
 `experiments.extend_datasets` acquires the eight approved cohorts using pinned
 cMD/ASAP sources, exports unchanged sparse values into `cache/inputs/`, waits for
@@ -95,11 +111,12 @@ filters `.8 .7`. Downloads, checksums, import protocols and an accession-overlap
 audit stay in `datasets/cMD_downloads/.sources/`. Converters use the installed base R and Arrow
 environments read-only. Launch through `execution.resources`, using
 `--log-directory outputs/main_comparison/.cache/logs/extension`. Existing scientific
-caches are reused; graph launches retain the RAM guard and use the approved
-50-GiB free-disk reserve, recorded separately from scientific cache protocols.
+caches are reused only when signatures match. The approved 50-GiB free-disk reserve
+is the shared graph default, with no hidden subprocess override.
 Mann–Whitney shuffles reuse pooled ranks/tie corrections with up to 24
-shared-memory workers, each retaining one native numerical thread. The optimized
-path is fingerprinted separately and checked against SciPy before extending counts.
+shared-memory workers, each retaining one native numerical thread. Those kernels
+are part of the ordinary scientific fingerprints and tested against SciPy. Bins
+normalizers are calculated once per fixed feature family and label-group count.
 
 ## Research agents
 

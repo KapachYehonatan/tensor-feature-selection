@@ -20,13 +20,14 @@ def extract(source, metadata_path, destination):
     uuid_column = table.schema_arrow.names.index('uuid')
     genes, values, rows, samples, seen = {}, [], [], [], set()
     keys = list(sample_index)
+    chosen_uuids = pc.unique(keys)
     for group in range(table.num_row_groups):
         statistics = table.metadata.row_group(group).column(uuid_column).statistics
         if statistics is not None and statistics.has_min_max:
             if not any(statistics.min <= key <= statistics.max for key in keys):
                 continue
         for batch in table.iter_batches(row_groups=[group], columns=columns, batch_size=100_000, use_threads=False):
-            chosen = batch.filter(pc.is_in(batch.column('uuid'), value_set=pc.unique(metadata.uuid.tolist())))
+            chosen = batch.filter(pc.is_in(batch.column('uuid'), value_set=chosen_uuids))
             if not len(chosen):
                 continue
             frame = chosen.to_pandas()

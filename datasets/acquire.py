@@ -1,6 +1,5 @@
 """Acquire the eight approved cohorts and export unchanged sparse supplied values."""
 from pathlib import Path
-import hashlib
 import gzip
 import json
 import subprocess
@@ -155,17 +154,9 @@ def prepare_one(name, metadata, resources):
     destination = cache.CACHE / 'inputs' / name
     if destination.exists():
         saved = json.loads((destination / 'protocol.json').read_text())
-        saved_key = hashlib.sha256(json.dumps(saved, sort_keys=True).encode()).hexdigest()
         if saved != record:
-            # The first exports fingerprinted the R reader even when it was unused.
-            compatible = dict(saved, code={k: v for k, v in saved['code'].items() if k in record['code']},
-                              files={k: v for k, v in saved['files'].items() if k in record['files']})
-            if kind == 'rds' or compatible != record:
-                raise ValueError(f'Existing input export is incompatible: {destination}')
-            cache.write_json(destination / 'compatibility.json', dict(
-                original_signature=saved_key, compatible_signature=key,
-                reason='Removed unused converter dependencies; all source, target, used-code and software fingerprints match.'))
-        if not cache.complete(destination, saved_key):
+            raise ValueError(f'Existing input export is incompatible: {destination}')
+        if not cache.complete(destination, key):
             raise ValueError(f'Incomplete input export: {destination}')
         check_counts(pd.read_csv(destination / 'samples.csv'), name)
         print(f'{name}: compatible input export already complete', flush=True)

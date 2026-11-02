@@ -1,14 +1,17 @@
 """Training-scaled balanced L2 prediction and saved-probability summaries."""
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score
-from sklearn.pipeline import make_pipeline
+from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import StandardScaler
+from execution.spec import Evaluation
 
 SEED = MODEL_SEED = 42
 
-def new_model(model_seed=MODEL_SEED):
+def new_model(model_seed: int = MODEL_SEED) -> Pipeline:
+    """Create the fixed scaling/classifier pipeline; fitting is always training-only."""
     return make_pipeline(
         StandardScaler(with_mean=False),
         LogisticRegression(
@@ -21,7 +24,12 @@ def new_model(model_seed=MODEL_SEED):
     )
 
 
-def predict_model(train_x, train_y, test_x, model_seed=MODEL_SEED):
+def predict_model(train_x: sparse.spmatrix, train_y: np.ndarray, test_x: sparse.spmatrix,
+                  model_seed: int = MODEL_SEED) -> np.ndarray:
+    """Fit sample×feature predictors; return one label-1 probability per test row.
+
+    Empty selections use training prevalence rather than a fitted classifier.
+    """
     if train_x.shape[1] == 0:
         return np.full(test_x.shape[0], np.mean(train_y))
     model = new_model(model_seed)
@@ -29,7 +37,8 @@ def predict_model(train_x, train_y, test_x, model_seed=MODEL_SEED):
     return model.predict_proba(test_x)[:, 1]
 
 
-def predict_prefixes(train, test, ytrain, ytest, ks):
+def predict_prefixes(train: sparse.spmatrix, test: sparse.spmatrix, ytrain: np.ndarray,
+                     ytest: np.ndarray, ks: tuple[int, ...]) -> pd.DataFrame:
     """Fit each distinct prefix once; metrics are calculated from saved probabilities."""
     predictions, cache = [], {}
     for k in ks:
@@ -44,13 +53,14 @@ def predict_prefixes(train, test, ytrain, ytest, ks):
 
 
 
-def point_metrics(y, probability):
+def point_metrics(y: np.ndarray, probability: np.ndarray) -> dict[str, float]:
+    """Evaluate aligned binary labels/probabilities; threshold class predictions at .5."""
     prediction = probability >= .5
     return dict(auroc=roc_auc_score(y, probability), precision=precision_score(y, prediction, zero_division=0),
         recall=recall_score(y, prediction, zero_division=0), f1=f1_score(y, prediction, zero_division=0))
 
 
-def summarize(folds, predictions, evaluation):
+def summarize(folds: pd.DataFrame, predictions: pd.DataFrame, evaluation: Evaluation) -> pd.DataFrame:
     """Incomplete CV pairs never enter mean-fold or pooled OOF comparisons."""
     columns = ['dataset', 'method', 'requested_k', 'auroc_cv_mean', 'auroc_fold_sd',
                'precision_cv_mean', 'recall_cv_mean', 'f1_cv_mean', 'auroc_pooled_oof',

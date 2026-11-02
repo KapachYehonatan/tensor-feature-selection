@@ -2,9 +2,9 @@
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
+import sys
 
-JOIN_PROJECT = Path("/home/kapachy/Microbium/bernoulli-correlation-join")
-WORKER = Path(__file__).with_name("worker.py")
+PROJECT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -16,7 +16,7 @@ class BernoulliGraph:
     memory_gib: float = 125
     working_memory_gib: float = 24
     reserve_gib: float = 16
-    free_disk_gib: float = 500
+    free_disk_gib: float = 50
     output_gib: float = 40
 
     def __post_init__(self):
@@ -26,7 +26,7 @@ class BernoulliGraph:
             raise ValueError("Invalid Bernoulli graph/resource settings")
 
     def command(self, matrix, selection, output):
-        return [str(JOIN_PROJECT / ".venv/bin/python"), "-u", str(WORKER),
+        return [sys.executable, "-u", "-m", "methods.graphs.worker",
                 str(matrix), str(selection), str(output), "--threshold", str(self.threshold),
                 "--threshold-step", str(self.step), "--workers", str(self.workers),
                 "--memory-gb", str(self.memory_gib), "--working-memory-gb", str(self.working_memory_gib),
@@ -36,8 +36,13 @@ class BernoulliGraph:
     def build(self, matrix, selection, output):
         with (Path(output).parent / "graph.log").open("a") as log:
             subprocess.run(self.command(matrix, selection, output) + ["--mode", "graph"],
-                           check=True, stdout=log, stderr=subprocess.STDOUT)
+                           check=True, stdout=log, stderr=subprocess.STDOUT, cwd=PROJECT)
 
     def dependencies(self):
-        from methods.graphs import worker
-        return (type(self).build, type(self).command, worker.build_graph, worker.pack_sparse_detection)
+        from methods.graphs.preparation import build_graph, pack_sparse_detection
+        from methods.graphs.worker import main
+        from execution.cache import write_json
+        return (type(self).build, type(self).command, build_graph, pack_sparse_detection, main, write_json)
+
+    def source_files(self):
+        return tuple(Path(__file__).with_name(name) for name in ("exact.py", "kernels.py", "resources.py"))

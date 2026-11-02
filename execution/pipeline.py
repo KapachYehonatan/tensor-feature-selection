@@ -1,25 +1,25 @@
 """Shared fold-local and all-sample execution of compositional methods."""
-from collections import defaultdict
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import fcntl
 import json
-import traceback
-import subprocess
-import tempfile
 import shutil
-from functools import lru_cache
+import tempfile
+import traceback
+
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.model_selection import StratifiedKFold
-from datasets.loading import load
+
+from datasets.loading import Dataset, load
 from execution import cache
+from execution.spec import Experiment, Evaluation
 from methods import preprocessing as prep, representations as reps
-from methods.pipelines import construct
-from methods.graphs.bernoulli_join import JOIN_PROJECT
-from methods.selectors.mann_whitney import (
-    MannWhitney, PreparedMannWhitney, prepare_mann_whitney, MANN_WHITNEY_CHUNK, SHUFFLE_WORKERS,
-)
+from methods.pipelines import Method, construct
+from methods.selectors.mann_whitney import MannWhitney
 from metrics.prediction import predict_prefixes, predict_model, point_metrics, new_model, summarize
 from metrics.correlation import average_pairwise_absolute_correlation
 from metrics.shuffled_fdp import label_permutations, discovery_statistics
@@ -27,6 +27,7 @@ from metrics.shuffled_fdp import label_permutations, discovery_statistics
 
 @dataclass
 class Context:
+    """Named analysis scope and disjoint integer training/validation row indices."""
     scope: str
     training: np.ndarray
     validation: np.ndarray
@@ -34,6 +35,12 @@ class Context:
 
 @dataclass
 class Family:
+    """All-sample, training-defined representation and its stage provenance.
+
+    values has samples×eligible-features shape. ids maps its columns to pair,
+    bacterium, gene or learned-cluster IDs; original_size is the complete family
+    size before exclusions, not the number of eligible matrix columns.
+    """
     key: str
     directory: Path
     values: sparse.csr_matrix
@@ -42,14 +49,8 @@ class Family:
     references: dict
 
 
-@lru_cache(None)
-def external_versions():
-    text = subprocess.check_output([str(JOIN_PROJECT / ".venv/bin/python"), "-c",
-        "import json,sys,numpy,numba,igraph;print(json.dumps(dict(python=sys.version,numpy=numpy.__version__,numba=numba.__version__,igraph=igraph.__version__)))"], text=True)
-    return json.loads(text)
-
-
-def contexts(y, evaluation):
+def contexts(y: np.ndarray, evaluation: Evaluation) -> list[Context]:
+    """Create identical stratified splits for all methods, checking once-only coverage."""
     if set(np.unique(y)) != {0, 1} or np.bincount(np.asarray(y, dtype=int)).min() < evaluation.folds:
         raise ValueError("Stratified CV requires both classes with at least one per fold")
     folds = StratifiedKFold(evaluation.folds, shuffle=True, random_state=evaluation.seed)
@@ -64,12 +65,8 @@ def contexts(y, evaluation):
     return result
 
 
-def prepare_family(data, context, preprocessing, method, notify=None):
-    """Fit/cache a method on context.training; return Family values for all samples.
-
-    Its sample-by-feature matrix uses training-defined groups and eligible columns.
-    """
-    notify = notify or (lambda stage: None)
+def prepare_pairs(data: Dataset, context: Context, preprocessing: prep.Preprocessing) -> tuple[str, Path, np.ndarray]:
+    """Cache one shared training-local prevalence mask for this sample context."""
     fitting = cache.array_hash(context.training)
     key, record = cache.identity("preprocessing", dict(detection=cache.sparse_hash(data.values[context.training], values=False), fit=fitting),
         preprocessing, (type(preprocessing).fit, prep.prevalence_mask, prep.sample_support), software=("numpy", "scipy"))
@@ -85,15 +82,51 @@ def prepare_family(data, context, preprocessing, method, notify=None):
     with np.load(selection) as saved:
         retained = saved["feature_ids"]
         np.testing.assert_array_equal(saved["train_index"], context.training)
+    return key, selection, retained
+
+
+def prepare_families(data: Dataset, context: Context, experiment: Experiment,
+                     notify: Callable) -> Iterator[tuple[Method, Family]]:
+    """Yield method/family pairs; reuse identical representations within a context.
+
+    Retain matrices only while another selector still needs the same family.
+    """
+    prepared = prepare_pairs(data, context, experiment.preprocessing)
+    keys = [(m.representation, m.graph, m.clustering) for m in experiment.methods]
+    remaining, families = Counter(keys), {}
+    for method, key in zip(experiment.methods, keys):
+        print(f"{data.name}/{context.scope}: {method.name}", flush=True)
+        update = lambda stage: notify(stage, method.name)
+        update("preprocessing")
+        family = families.get(key)
+        if family is None:
+            family = prepare_family(data, context, experiment.preprocessing, method, update, prepared)
+        if remaining[key] > 1:
+            families[key] = family
+        yield method, family
+        remaining[key] -= 1
+        if not remaining[key]:
+            families.pop(key, None)
+
+
+def prepare_family(data: Dataset, context: Context, preprocessing: prep.Preprocessing, method: Method,
+                   notify: Callable | None = None, prepared: tuple | None = None) -> Family:
+    """Cache preprocessing → optional graph/partition → training-defined representation.
+
+    The returned values include validation rows, using groups and eligibility
+    learned exclusively from training. prepared reuses the shared pair mask.
+    """
+    notify = notify or (lambda stage: None)
+    fitting = cache.array_hash(context.training)
+    key, selection, retained = prepare_pairs(data, context, preprocessing) if prepared is None else prepared
     partition, partition_key, graph_key = None, None, None
     if method.representation == "join":
         detected = data.values[context.training][:, retained].tocsr()
         detection = dict(indices=cache.array_hash(detected.indices), indptr=cache.array_hash(detected.indptr),
                          shape=detected.shape, ids=cache.array_hash(retained), fit=fitting)
-        graph_key, graph_record = cache.identity("graph", detection, dict(graph=asdict(method.graph),
-            external={k: v for k, v in external_versions().items() if k != "igraph"}),
-            method.graph.dependencies(),
-            (JOIN_PROJECT / "bernoulli_join.py",), software=("numpy", "scipy"))
+        graph_settings = {k: v for k, v in asdict(method.graph).items() if k not in {"step", "edge_limit"}}
+        graph_key, graph_record = cache.identity("graph", detection, graph_settings,
+            method.graph.dependencies(), method.graph.source_files(), software=("numpy", "scipy", "numba"))
         graph = cache.stage_path(data.name, context.scope, "graph", graph_key, graph_record)
         cached = cache.complete(graph, graph_key)
         notify("graph")
@@ -112,9 +145,8 @@ def prepare_family(data, context, preprocessing, method, notify=None):
             method.graph.build(data.path / "X_valid.npz", selection, graph / "work")
             cache.seal(graph, graph_key, [p for p in (graph / "work").rglob("*") if p.is_file()])
         partition_key, partition_record = cache.identity("clustering", dict(graph=graph_key),
-            dict(graph_resources=asdict(method.graph), clustering=asdict(method.clustering), external=external_versions()),
-            method.clustering.dependencies(),
-            (JOIN_PROJECT / "community_detection.py",), software=("numpy", "scipy"))
+            dict(graph_resources=asdict(method.graph), clustering=asdict(method.clustering)),
+            method.clustering.dependencies(), method.clustering.source_files(), software=("numpy", "scipy", "numba", "igraph"))
         partition_dir = cache.stage_path(data.name, context.scope, "clustering", partition_key, partition_record)
         cached = cache.complete(partition_dir, partition_key)
         notify("clustering")
@@ -143,15 +175,13 @@ def prepare_family(data, context, preprocessing, method, notify=None):
                   dict(preprocessing=key, graph=graph_key, clustering=partition_key, representation=family_key))
 
 
-def test_dependencies(selector):
-    return selector.dependencies()
-
-
-def selection(data, context, family, method, rank_limit):
+def selection(data: Dataset, context: Context, family: Family, method: Method,
+              rank_limit: int) -> tuple[str, dict, str]:
+    """Cache training evidence/selection; return selection key, column positions and test key."""
     selector = method.selector
     key, record = cache.identity("testing", dict(values=cache.sparse_hash(family.values[context.training]), ids=cache.array_hash(family.ids),
         labels=cache.array_hash(data.samples.y.to_numpy()[context.training])), dict(kind=selector.kind, settings=selector.test_settings()),
-        test_dependencies(selector), software=("numpy", "scipy"))
+        selector.dependencies(), software=("numpy", "scipy"))
     directory = cache.stage_path(data.name, context.scope, "testing", key, record)
     if not cache.complete(directory, key):
         result = selector.test(family.values[context.training], data.samples.y.to_numpy()[context.training])
@@ -177,7 +207,9 @@ def selection(data, context, family, method, rank_limit):
     return selected_key, result, key
 
 
-def prediction(data, context, family, selected_key, selected, evaluation):
+def prediction(data: Dataset, context: Context, family: Family, selected_key: str,
+               selected: dict, evaluation: Evaluation) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Evaluate training-ranked prefixes on validation rows; return metrics, OOF rows and key."""
     key, record = cache.identity("prediction", dict(selection=selected_key,
         validation=cache.array_hash(context.validation), labels=cache.array_hash(data.samples.y.to_numpy()),
         validation_values=cache.sparse_hash(family.values[context.validation][:, selected["order"]]), samples=data.fingerprint["samples.csv"]),
@@ -198,129 +230,107 @@ def prediction(data, context, family, selected_key, selected, evaluation):
     return metrics, predictions, key
 
 
-def prepare_mw_shuffles(family, methods, targets, states, completed):
-    """Validate the optimized implementation separately from unchanged scientific protocols."""
-    signature, record = cache.identity('mw_shuffle_execution', dict(family=family.key),
-        dict(workers=SHUFFLE_WORKERS, chunk_size=MANN_WHITNEY_CHUNK, rank_dtype='float64',
-             reference='installed SciPy asymptotic two-sided MW'),
-        (PreparedMannWhitney, prepare_mann_whitney, prepare_mw_shuffles), software=('numpy', 'scipy'))
-    missing = []
-    for method, directory, key, values in states:
-        path = directory / 'mw_shuffle_execution.json'
-        if path.exists():
-            saved = json.loads(path.read_text())
-            if saved['signature'] != signature or saved['protocol'] != record or saved['scientific_signature'] != key:
-                raise ValueError(f'Changed Mann-Whitney shuffle implementation: {directory}')
-        elif directory not in completed:
-            missing.append((path, key, values))
-    if len(completed) == len(states):
-        return None
-    prepared = prepare_mann_whitney(family.values)
-    if missing:
-        indices = np.arange(min(3, len(targets)))
-        expected = methods[0].selector.batch_test(family.values, targets[indices])
-        actual = prepared.test(targets[indices])
-        np.testing.assert_array_equal(actual, expected)
-        for method, _, _, saved_counts in states:
-            for i, old, new in zip(indices, expected, actual):
-                arguments = (family.values, family.ids, family.original_size, 75)
-                reference = method.selector.select({'p': old}, *arguments)
-                result = method.selector.select({'p': new}, *arguments)
-                for field in ('order', 'native', 'q'):
-                    np.testing.assert_array_equal(result[field], reference[field])
-                if saved_counts[i] >= 0 and saved_counts[i] != len(reference['native']):
-                    raise ValueError('Saved shuffled discovery count disagrees with the SciPy replay')
-        for path, key, values in missing:
-            cache.write_json(path, dict(signature=signature, protocol=record, scientific_signature=key,
-                retained_shuffles=int(np.count_nonzero(values >= 0)), retained_counts_hash=cache.array_hash(values),
-                replay_indices=indices.tolist(), reference_p_hash=cache.array_hash(expected),
-                optimized_p_hash=cache.array_hash(actual), maximum_p_error=float(np.max(np.abs(actual - expected))) if actual.size else 0.,
-                p_values_order_and_discoveries_match=True))
-        print(f'Mann-Whitney: pooled ranks prepared once; up to {prepared.workers} shared-memory workers; '
-              f'{len(indices)} SciPy shuffle replays matched exactly.', flush=True)
-    return prepared
+@dataclass
+class ShuffleState:
+    """One method's fixed-budget counts; -1 marks an unfinished label shuffle."""
+    method: Method
+    directory: Path
+    key: str
+    counts: np.ndarray
+    complete: bool
+
+    def save(self, *, final: bool = False) -> None:
+        if self.complete:
+            return
+        destination = self.directory if final else self.directory / "checkpoint"
+        destination.mkdir(exist_ok=True)
+        temporary = destination / "counts.tmp.npy"
+        np.save(temporary, self.counts)
+        temporary.replace(destination / "counts.npy")
+        cache.seal(destination, self.key, [destination / "counts.npy"])
+        self.complete = final
 
 
-def shuffled_counts(data, family, methods, evaluation):
-    """One transient evidence batch per family; all cutoffs reuse each MW vector."""
-    y = data.samples.y.to_numpy()
-    targets = label_permutations(y, data.name + "/full_data", evaluation.shuffles, evaluation.seed)
-    states, completed = [], set()
-    for method in methods:
-        selector = method.selector
-        key, record = cache.identity("shuffles", dict(family=family.key, labels=cache.array_hash(y)),
-            dict(selector=asdict(selector), budget=evaluation.shuffles, seed=evaluation.seed),
-            (*test_dependencies(selector), *selector.selection_dependencies(), label_permutations),
-            software=("numpy", "scipy"))
-        directory = cache.stage_path(data.name, "full", "shuffles", key, record)
-        values = np.full(evaluation.shuffles, -1, dtype=int)
-        if cache.complete(directory, key):
-            values = np.load(directory / "counts.npy")
-            completed.add(directory)
-        elif cache.complete(directory / "checkpoint", key):
-            values = np.load(directory / "checkpoint/counts.npy")
-        size = selector.family_size(len(family.ids), family.original_size)
-        if (values.shape != (evaluation.shuffles,) or not np.issubdtype(values.dtype, np.integer)
-                or np.any(values < -1) or np.any(values > size)):
-            raise ValueError("Invalid shuffle checkpoint")
-        states.append((method, directory, key, values))
+def load_shuffle_state(data: Dataset, family: Family, method: Method, evaluation: Evaluation) -> ShuffleState:
+    """Validate and resume this method's full-data discovery counts."""
+    selector = method.selector
+    key, record = cache.identity("shuffles", dict(family=family.key, labels=cache.array_hash(data.samples.y.to_numpy())),
+        dict(selector=asdict(selector), budget=evaluation.shuffles, seed=evaluation.seed),
+        (*selector.dependencies(), *selector.selection_dependencies(), label_permutations), software=("numpy", "scipy"))
+    directory = cache.stage_path(data.name, "full", "shuffles", key, record)
+    complete = cache.complete(directory, key)
+    checkpoint = directory if complete else directory / "checkpoint"
+    counts = (np.load(checkpoint / "counts.npy") if complete or cache.complete(checkpoint, key)
+              else np.full(evaluation.shuffles, -1, dtype=int))
+    family_size = selector.family_size(len(family.ids), family.original_size)
+    if (counts.shape != (evaluation.shuffles,) or not np.issubdtype(counts.dtype, np.integer)
+            or np.any(counts < (-1 if not complete else 0)) or np.any(counts > family_size)):
+        raise ValueError("Invalid shuffle checkpoint")
+    return ShuffleState(method, directory, key, counts, complete)
+
+
+def shuffled_counts(data: Dataset, family: Family, methods: list[Method], evaluation: Evaluation) -> tuple[dict, dict]:
+    """Return counts and stage keys by method, using one shared label/evidence batch.
+
+    Every method receives the same permutations of the full-data participant
+    labels. A completed baseline count of zero certifies zero for a masked-BY
+    filter only when its correction, including alpha, is identical.
+    """
+    targets = label_permutations(data.samples.y.to_numpy(), data.name + "/full_data", evaluation.shuffles, evaluation.seed)
+    states = [load_shuffle_state(data, family, method, evaluation) for method in methods]
     selector = methods[0].selector
-    optimized_mw = type(selector) is MannWhitney and family.values.dtype == np.float64
-    prepared = prepare_mw_shuffles(family, methods, targets, states, completed) if optimized_mw else None
-    if len(completed) == len(states):
-        return ({method.name: values for method, _, _, values in states},
-                {method.name: key for method, _, key, _ in states})
-    if not optimized_mw:
+    if not all(state.complete for state in states):
         prepared = selector.prepare(family.values)
-    baselines = {s[0].selector.correction: s for s in states if isinstance(s[0].selector, MannWhitney)
-                 and s[0].selector.correlation_threshold is None}
-    for left in range(0, evaluation.shuffles, 8):
-        indices = []
-        for i in range(left, min(left + 8, evaluation.shuffles)):
-            pending = [s for s in states if s[3][i] < 0]
-            for state in pending:
-                baseline = baselines.get(state[0].selector.correction)
-                if baseline is not None and baseline[3][i] == 0:
-                    state[3][i] = 0
-            if any(s[3][i] < 0 for s in pending):
-                indices.append(i)
-        if indices:
-            vectors = prepared.test(targets[indices]) if optimized_mw else selector.batch_test(family.values, targets[indices], prepared)
-            for i, vector in zip(indices, vectors):
-                evidence = {selector.kind: vector}
-                original_counts = {}
-                for method, directory, key, values in states:
-                    if values[i] >= 0:
-                        continue
-                    if original_counts.get(method.selector.correction) == 0 and isinstance(method.selector, MannWhitney):
-                        values[i] = 0
-                    else:
-                        values[i] = len(method.selector.select(evidence, family.values, family.ids, family.original_size, 0)["native"])
-                    if isinstance(method.selector, MannWhitney) and method.selector.correlation_threshold is None:
-                        original_counts[method.selector.correction] = values[i]
-        for _, directory, key, values in states:
-            if directory in completed:
-                continue
-            checkpoint = directory / "checkpoint"
-            checkpoint.mkdir(exist_ok=True)
-            temporary = checkpoint / "counts.tmp.npy"
-            np.save(temporary, values)
-            temporary.replace(checkpoint / "counts.npy")
-            cache.seal(checkpoint, key, [checkpoint / "counts.npy"])
-        print(f"{data.name}: shuffled {min(left + 8, evaluation.shuffles)}/{evaluation.shuffles}", flush=True)
-    result = {}
-    for method, directory, key, values in states:
-        size = method.selector.family_size(len(family.ids), family.original_size)
-        if np.any(values < 0) or np.any(values > size):
-            raise ValueError("Incomplete or invalid shuffled counts")
-        if directory not in completed:
-            np.save(directory / "counts.npy", values)
-            cache.seal(directory, key, [directory / "counts.npy"])
-        result[method.name] = values
-    return result, {method.name: key for method, _, key, _ in states}
+        baselines = {state.method.selector.correction: state for state in states
+                     if isinstance(state.method.selector, MannWhitney)
+                     and state.method.selector.correlation_threshold is None}
+        for start in range(0, evaluation.shuffles, 8):
+            indices = []
+            for index in range(start, min(start + 8, evaluation.shuffles)):
+                pending = [state for state in states if state.counts[index] < 0]
+                for state in pending:
+                    baseline = baselines.get(state.method.selector.correction)
+                    if baseline is not None and baseline.counts[index] == 0:
+                        state.counts[index] = 0
+                if any(state.counts[index] < 0 for state in pending):
+                    indices.append(index)
+            if indices:
+                vectors = selector.batch_test(family.values, targets[indices], prepared)
+                for index, vector in zip(indices, vectors):
+                    evidence = {selector.kind: vector}
+                    for state in states:
+                        if state.counts[index] >= 0:
+                            continue
+                        baseline = baselines.get(state.method.selector.correction)
+                        if baseline is not None and baseline.counts[index] == 0:
+                            state.counts[index] = 0
+                        else:
+                            selected = state.method.selector.select(evidence, family.values, family.ids, family.original_size, 0)
+                            state.counts[index] = len(selected["native"])
+            for state in states:
+                state.save()
+            print(f"{data.name}: shuffled {min(start + 8, evaluation.shuffles)}/{evaluation.shuffles}", flush=True)
+        for state in states:
+            size = state.method.selector.family_size(len(family.ids), family.original_size)
+            if np.any(state.counts < 0) or np.any(state.counts > size):
+                raise ValueError("Incomplete or invalid shuffled counts")
+            state.save(final=True)
+    return ({state.method.name: state.counts for state in states},
+            {state.method.name: state.key for state in states})
 
 
-def run(experiment):
+def run(experiment: Experiment) -> list[dict]:
+    """Serialize scientific writers: different experiments share expensive stage files."""
+    cache.CACHE.mkdir(parents=True, exist_ok=True)
+    with (cache.CACHE / ".pipeline.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("Another scientific experiment is running; retry after it finishes") from error
+        return _run(experiment)
+
+
+def _run(experiment: Experiment) -> list[dict]:
     """Execute an Experiment, publish complete exports, and return dataset failure records."""
     from reporting.comparison import render, validate
     validate(experiment)
@@ -361,85 +371,108 @@ def run(experiment):
     return []
 
 
-def run_tables(experiment, tables):
-    """Write replacement tables to private Path tables; return dataset failure records.
+def run_cv(data: Dataset, experiment: Experiment, status: Callable) -> tuple[list, list, list]:
+    """Run training-local selection/prediction; return fold frames, OOF frames and stage references."""
+    fold_rows, predictions, references = [], [], []
+    for fold, context in enumerate(contexts(data.samples.y.to_numpy(), experiment.evaluation)):
+        notify = lambda stage, name: status(stage, data.name, context.scope, name)
+        for method, family in prepare_families(data, context, experiment, notify):
+            notify("selection", method.name)
+            selection_key, selected, testing_key = selection(data, context, family, method, max(experiment.evaluation.k))
+            notify("prediction", method.name)
+            metrics, probabilities, prediction_key = prediction(data, context, family, selection_key, selected, experiment.evaluation)
+            references.append(dict(dataset=data.name, scope=context.scope, method=method.name,
+                **family.references, testing=testing_key, selection=selection_key, prediction=prediction_key))
+            fold_rows.append(metrics.assign(dataset=data.name, method=method.name, fold=fold, participants=len(data.samples)))
+            predictions.append(probabilities.assign(dataset=data.name, method=method.name, fold=fold))
+    return fold_rows, predictions, references
 
-    Live status stays in the experiment's real cache while these tables are staged.
+
+def run_full_statistics(data: Dataset, experiment: Experiment, status: Callable) -> tuple[list, list, list]:
+    """Select on all samples; return native-set metrics, score-ranked correlations and references.
+
+    These representations never enter CV. Share shuffled evidence only between
+    methods with the same feature family and testing-stage identity.
     """
+    context = Context("full", np.arange(len(data.samples)), np.array([], int))
+    groups, families, choices, references = defaultdict(list), {}, {}, {}
+    notify = lambda stage, name: status(stage, data.name, "full", name)
+    for method, family in prepare_families(data, context, experiment, notify):
+        notify("selection", method.name)
+        selection_key, selected, testing_key = selection(data, context, family, method, max(experiment.evaluation.k))
+        references[method.name] = dict(dataset=data.name, scope="full", method=method.name,
+            **family.references, testing=testing_key, selection=selection_key)
+        families[family.key] = family
+        groups[(family.key, testing_key)].append(method)
+        choices[method.name] = selected
+    full_rows, correlations = [], []
+    for (family_key, _), methods in groups.items():
+        family = families[family_key]
+        stage = "shuffles" if "shuffled_fdp" in experiment.metrics else "metrics"
+        notify(stage, ", ".join(method.name for method in methods))
+        counts, count_keys = (shuffled_counts(data, family, methods, experiment.evaluation)
+                              if "shuffled_fdp" in experiment.metrics else ({}, {}))
+        for method in methods:
+            selected = choices[method.name]
+            size = method.selector.family_size(len(family.ids), family.original_size)
+            row = dict(dataset=data.name, method=method.name, tested_features=size, real_discoveries=len(selected["native"]))
+            if method.name in counts:
+                row.update(discovery_statistics(counts[method.name], len(selected["native"]), size))
+                references[method.name]["shuffles"] = count_keys[method.name]
+            if "correlation" in experiment.metrics:
+                row.update(average_pairwise_absolute_correlation(family.values, selected["native"]))
+                for k in experiment.evaluation.coarse_k:
+                    correlations.append(dict(dataset=data.name, method=method.name, requested_k=k,
+                        **average_pairwise_absolute_correlation(family.values, selected["order"][:k])))
+            full_rows.append(row)
+    return full_rows, correlations, list(references.values())
+
+
+def write_tables(directory: Path, frames: dict, records: dict) -> None:
+    """Checkpoint private export buffers; frame lists concatenate rows, record lists become tables."""
+    for filename, rows in frames.items():
+        if rows:
+            pd.concat(rows, ignore_index=True).to_csv(directory / filename, index=False)
+    for filename, rows in records.items():
+        if rows:
+            pd.DataFrame(rows).to_csv(directory / filename, index=False)
+
+
+def run_tables(experiment: Experiment, tables: Path) -> list[dict]:
+    """Build private replacement tables; publish nothing and return dataset failures."""
     output = cache.PROJECT / "outputs" / experiment.name
     cache.write_json(tables / "experiment.json", asdict(experiment))
     cache.write_json(tables / "metric_protocol.json", cache.metric_protocol(experiment)[1])
+
     def status(stage, dataset=None, scope=None, method=None, state="running"):
-        cache.write_json(output / ".cache/status.json", dict(state=state, dataset=dataset, scope=scope, method=method, stage=stage))
-    fold_rows, oof_rows, full_rows, correlation_rows, failures, references = [], [], [], [], [], []
+        cache.write_json(output / ".cache/status.json",
+                         dict(state=state, dataset=dataset, scope=scope, method=method, stage=stage))
+
+    fold_rows, predictions, full_rows, correlations, failures, references = [], [], [], [], [], []
     for dataset in experiment.datasets:
         try:
             data = load(dataset)
             print(f"{dataset}: samples={len(data.samples)}, classes={data.samples.y.value_counts().to_dict()}, "
                   f"pairs={data.values.shape[1]}, bacteria={len(np.unique(data.pair_bacteria))}, genes={len(np.unique(data.pair_gene))}", flush=True)
-            scopes = contexts(data.samples.y.to_numpy(), experiment.evaluation) if "prediction" in experiment.metrics else []
             if "prediction" in experiment.metrics:
-                for fold, context in enumerate(scopes):
-                    for method in experiment.methods:
-                        print(f"{dataset}/{context.scope}: {method.name}", flush=True)
-                        update = lambda stage: status(stage, dataset, context.scope, method.name)
-                        update("preprocessing")
-                        family = prepare_family(data, context, experiment.preprocessing, method, update)
-                        update("selection")
-                        selected_key, chosen, test_key = selection(data, context, family, method, max(experiment.evaluation.k))
-                        update("prediction")
-                        metrics, predictions, prediction_key = prediction(data, context, family, selected_key, chosen, experiment.evaluation)
-                        references.append(dict(dataset=dataset, scope=context.scope, method=method.name,
-                            **family.references, testing=test_key, selection=selected_key, prediction=prediction_key))
-                        fold_rows.append(metrics.assign(dataset=dataset, method=method.name, fold=fold, participants=len(data.samples)))
-                        oof_rows.append(predictions.assign(dataset=dataset, method=method.name, fold=fold))
+                folds, oof, stages = run_cv(data, experiment, status)
+                fold_rows.extend(folds)
+                predictions.extend(oof)
+                references.extend(stages)
             if set(experiment.metrics) - {"prediction"}:
-                context = Context("full", np.arange(len(data.samples)), np.array([], int))
-                groups = defaultdict(list)
-                families, choices = {}, {}
-                for method in experiment.methods:
-                    print(f"{dataset}/full: {method.name}", flush=True)
-                    update = lambda stage: status(stage, dataset, "full", method.name)
-                    update("preprocessing")
-                    family = prepare_family(data, context, experiment.preprocessing, method, update)
-                    update("selection")
-                    selected_key, chosen, test_key = selection(data, context, family, method, max(experiment.evaluation.k))
-                    references.append(dict(dataset=dataset, scope="full", method=method.name,
-                        **family.references, testing=test_key, selection=selected_key))
-                    families[family.key] = family
-                    groups[(family.key, test_key)].append(method)
-                    choices[method.name] = chosen
-                for (family_key, _), methods in groups.items():
-                    family = families[family_key]
-                    status("shuffles" if "shuffled_fdp" in experiment.metrics else "metrics", dataset, "full", ", ".join(m.name for m in methods))
-                    counts, count_keys = shuffled_counts(data, family, methods, experiment.evaluation) if "shuffled_fdp" in experiment.metrics else ({}, {})
-                    for method in methods:
-                        chosen = choices[method.name]
-                        size = method.selector.family_size(len(family.ids), family.original_size)
-                        row = dict(dataset=dataset, method=method.name, tested_features=size, real_discoveries=len(chosen["native"]))
-                        if method.name in counts:
-                            row.update(discovery_statistics(counts[method.name], len(chosen["native"]), size))
-                            next(r for r in reversed(references) if r["scope"] == "full" and r["method"] == method.name)["shuffles"] = count_keys[method.name]
-                        if "correlation" in experiment.metrics:
-                            row.update(average_pairwise_absolute_correlation(family.values, chosen["native"]))
-                            for k in experiment.evaluation.coarse_k:
-                                correlation_rows.append(dict(dataset=dataset, method=method.name, requested_k=k,
-                                    **average_pairwise_absolute_correlation(family.values, chosen["order"][:k])))
-                        full_rows.append(row)
+                metrics, redundancy, stages = run_full_statistics(data, experiment, status)
+                full_rows.extend(metrics)
+                correlations.extend(redundancy)
+                references.extend(stages)
             del data
         except Exception as error:
             failures.append(dict(dataset=dataset, error=f"{type(error).__name__}: {error}"))
             print(traceback.format_exc(), flush=True)
             status("dataset", dataset, state="failed")
-        for filename, rows in (("fold_metrics.csv", fold_rows), ("predictions.csv.gz", oof_rows)):
-            if rows:
-                pd.concat(rows, ignore_index=True).to_csv(tables / filename, index=False)
-        for filename, rows in (("full_metrics.csv", full_rows), ("topk_correlations.csv", correlation_rows), ("failures.csv", failures)):
-            if rows:
-                pd.DataFrame(rows).to_csv(tables / filename, index=False)
-        if references:
-            pd.DataFrame(references).to_csv(tables / "artifacts.csv", index=False)
+        write_tables(tables, {"fold_metrics.csv": fold_rows, "predictions.csv.gz": predictions},
+            {"full_metrics.csv": full_rows, "topk_correlations.csv": correlations,
+             "failures.csv": failures, "artifacts.csv": references})
     if fold_rows:
-        summarize(pd.concat(fold_rows, ignore_index=True), pd.concat(oof_rows, ignore_index=True), experiment.evaluation).to_csv(
-            tables / "prediction_summary.csv", index=False)
+        summarize(pd.concat(fold_rows, ignore_index=True), pd.concat(predictions, ignore_index=True),
+                  experiment.evaluation).to_csv(tables / "prediction_summary.csv", index=False)
     return failures

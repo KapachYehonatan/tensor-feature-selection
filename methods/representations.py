@@ -2,8 +2,8 @@
 import numpy as np
 from scipy import sparse
 
-def marginal_matrix(matrix, pair_entity, n_entities):
-    """Sum pair columns into bacteria or gene marginal columns."""
+def marginal_matrix(matrix: sparse.spmatrix, pair_entity: np.ndarray, n_entities: int) -> sparse.csr_matrix:
+    """Sum sample×pair values into sample×entity columns using one entity ID per pair."""
     pair_entity = np.asarray(pair_entity, dtype=np.int64)
     if matrix.shape[1] != len(pair_entity):
         raise ValueError("Pair mapping does not match matrix columns")
@@ -14,8 +14,12 @@ def marginal_matrix(matrix, pair_entity, n_entities):
     return (matrix @ mapping).tocsr()
 
 
-def collapsed_average(matrix, entity, total_entities):
-    """Average retained pair columns belonging to each active entity."""
+def collapsed_average(matrix: sparse.spmatrix, entity: np.ndarray,
+                      total_entities: int) -> tuple[sparse.csr_matrix, np.ndarray]:
+    """Return sample×active-entity means and their original entity IDs.
+
+    Every retained pair contributes to its group's denominator, including zeros.
+    """
     counts = np.bincount(entity, minlength=total_entities)
     active = np.flatnonzero(counts)
     collapsed = marginal_matrix(matrix, entity, total_entities)[:, active]
@@ -23,11 +27,11 @@ def collapsed_average(matrix, entity, total_entities):
     return collapsed.tocsr(), active
 
 
-def aggregate_pair_clusters(train, test, labels):
-    """Average supplied pair values within learned clusters, including zeros."""
+def aggregate_pair_clusters(matrix: sparse.spmatrix, labels: np.ndarray) -> tuple[sparse.csr_matrix, np.ndarray]:
+    """Return sample×cluster means and cluster sizes from one label per retained pair."""
     labels = np.asarray(labels, dtype=int)
-    if labels.shape != (train.shape[1],) or train.shape[1] != test.shape[1]:
-        raise ValueError("cluster labels must align with train and test columns")
+    if labels.shape != (matrix.shape[1],):
+        raise ValueError("cluster labels must align with pair columns")
     if np.any(labels < 0):
         raise ValueError("every retained feature must have a nonnegative cluster")
     cluster_count = int(labels.max()) + 1
@@ -36,5 +40,5 @@ def aggregate_pair_clusters(train, test, labels):
         (1.0 / sizes[labels], (np.arange(len(labels)), labels)),
         shape=(len(labels), cluster_count),
     )
-    return (train @ assignment).tocsr(), (test @ assignment).tocsr(), sizes
+    return (matrix @ assignment).tocsr(), sizes
 

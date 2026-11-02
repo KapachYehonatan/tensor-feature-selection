@@ -7,6 +7,25 @@ from scipy.special import gammaln, logsumexp, xlogy
 from methods.correction import EBH
 
 
+@dataclass
+class PreparedBins:
+    """Sample-by-feature presence/high matrices and feature-by-three bin counts."""
+    presence: sparse.csc_matrix
+    high: sparse.csc_matrix
+    counts: np.ndarray
+    positive_count: int | None = None
+    log_normalizers: np.ndarray | None = None
+
+    def calibrate(self, positives: int) -> np.ndarray:
+        """Return one exact log normalizer per feature for this fixed label-group count."""
+        if self.log_normalizers is None:
+            self.positive_count = positives
+            self.log_normalizers = np.array([normalizer(*map(int, row), positives) for row in self.counts])
+        elif positives != self.positive_count:
+            raise ValueError("Prepared bins require unchanged label-group counts")
+        return self.log_normalizers
+
+
 def log_choose(n, k):
     return gammaln(np.asarray(n) + 1) - gammaln(np.asarray(k) + 1) - gammaln(np.asarray(n) - k + 1)
 
@@ -19,7 +38,8 @@ def log_lr(counts, positives, total_positive):
     return np.maximum(fitted - null, 0.)
 
 
-def prepare_bins(matrix):
+def prepare_bins(matrix: sparse.spmatrix) -> PreparedBins:
+    """Freeze label-blind zero/low/high bins from sample×feature supplied values."""
     x = sparse.csc_matrix(matrix, copy=True, dtype=float)
     x.sum_duplicates()
     x.eliminate_zeros()
@@ -38,7 +58,7 @@ def prepare_bins(matrix):
     presence = x.copy()
     presence.data = np.ones(x.nnz, np.int8)
     high_count = np.asarray(high.sum(axis=0)).ravel().astype(int)
-    return presence, high, np.column_stack((n - support, support - high_count, high_count))
+    return PreparedBins(presence, high, np.column_stack((n - support, support - high_count, high_count)))
 
 
 def table(n0, nl, nh, p):
@@ -57,8 +77,9 @@ def normalizer(n0, nl, nh, p):
     return float(logsumexp(mass + score))
 
 
-def evidence(prepared, targets):
-    presence, high_matrix, counts = prepared
+def evidence(prepared: PreparedBins, targets: np.ndarray) -> np.ndarray:
+    """Map shuffle×sample labels to shuffle×feature log e-values using fixed bins."""
+    presence, high_matrix, counts = prepared.presence, prepared.high, prepared.counts
     targets = np.asarray(targets)
     n = presence.shape[0]
     if (targets.ndim != 2 or not len(targets) or targets.shape[1] != n
@@ -74,7 +95,7 @@ def evidence(prepared, targets):
     cells = np.stack((p - present, present - high, high), axis=-1)
     if np.any(cells < 0) or np.any(cells > counts[None]):
         raise ValueError("Invalid observed cells")
-    return log_lr(counts[None], cells, p) - np.array([normalizer(*map(int, row), p) for row in counts])
+    return log_lr(counts[None], cells, p) - prepared.calibrate(p)
 
 
 @dataclass(frozen=True)
@@ -82,16 +103,20 @@ class Bins:
     kind = "log_e"
     correction: EBH = field(default_factory=EBH)
 
-    def test(self, matrix, y):
+    def test(self, matrix: sparse.spmatrix, y: np.ndarray) -> dict[str, np.ndarray]:
+        """Return one native log e-value per eligible feature from observed labels."""
         return dict(log_e=evidence(prepare_bins(matrix), np.asarray(y)[None])[0])
 
-    def batch_test(self, matrix, targets, prepared=None):
+    def batch_test(self, matrix: sparse.spmatrix, targets: np.ndarray,
+                   prepared: PreparedBins | None = None) -> np.ndarray:
+        """Return shuffle×feature log evidence; reuse label-blind bins/normalizers."""
         return evidence(prepare_bins(matrix) if prepared is None else prepared, targets)
 
-    def family_size(self, candidates, original):
+    def family_size(self, candidates: int, original: int) -> int:
+        """e-BH includes the original raw-pair catalog, with zero evidence for exclusions."""
         return original
 
-    def prepare(self, matrix):
+    def prepare(self, matrix: sparse.spmatrix) -> PreparedBins:
         return prepare_bins(matrix)
 
     def test_settings(self):
@@ -99,11 +124,13 @@ class Bins:
 
     def dependencies(self):
         return (type(self).test, type(self).batch_test, type(self).prepare, type(self).test_settings, prepare_bins,
-                evidence, table, log_choose, log_lr, normalizer.__wrapped__)
+                evidence, PreparedBins, table, log_choose, log_lr, normalizer.__wrapped__)
 
     def selection_dependencies(self):
         return (type(self).select, type(self).family_size, type(self.correction).select)
 
-    def select(self, result, matrix, ids, family_size, rank_limit):
+    def select(self, result: dict, matrix: sparse.spmatrix, ids: np.ndarray,
+                family_size: int, rank_limit: int) -> dict[str, np.ndarray]:
+        """Return ranked/native matrix-column positions; original pair IDs break ties."""
         order = np.lexsort((ids, -result["log_e"]))
         return dict(order=order[:rank_limit], native=self.correction.select(result["log_e"], ids, family_size))

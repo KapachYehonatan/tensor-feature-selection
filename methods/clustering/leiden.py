@@ -26,14 +26,21 @@ class Leiden:
             "--iterations", str(self.iterations), "--community-workers", str(self.workers),
             "--community-working-memory-gb", str(self.working_memory_gib)]
         with (Path(output).parent / "clustering.log").open("a") as log:
-            subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT)
+            subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT,
+                           cwd=Path(__file__).resolve().parents[2])
         state = json.loads((Path(output) / "integration.json").read_text())
         if state["status"] != "complete" or state["edges_pruned"]:
             raise ValueError("Partition is incomplete or its source edges were pruned")
         return state
 
     def dependencies(self):
-        from methods.graphs import worker
-        return (type(self).fit, worker.cluster_graph, worker.fallback_thresholds,
-                worker.choose_effective_threshold, worker.count_threshold_edges,
-                worker.filter_exact_graph, worker.edge_strength, worker.stable_cluster_labels)
+        from methods.clustering import partition
+        from methods.graphs import preparation, worker
+        from execution.cache import write_json
+        return (type(self).fit, partition.cluster_graph, partition.fallback_thresholds,
+                partition.choose_effective_threshold, partition.stable_cluster_labels,
+                preparation.count_threshold_edges, preparation.filter_exact_graph, preparation.edge_strength, worker.main, write_json)
+
+    def source_files(self):
+        return (Path(__file__).with_name("community.py"), Path(__file__).with_name("partition.py"),
+                Path(__file__).parents[1] / "graphs/resources.py")

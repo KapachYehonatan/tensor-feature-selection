@@ -12,7 +12,8 @@ class BY:
         if not 0 < self.alpha < 1:
             raise ValueError("Invalid BY level")
 
-    def adjust(self, p):
+    def adjust(self, p: np.ndarray) -> np.ndarray:
+        """Adjust every eligible feature's p-value together; return aligned BY q-values."""
         p = np.asarray(p, dtype=float)
         if p.ndim != 1 or not np.isfinite(p).all() or np.any((p < 0) | (p > 1)):
             raise ValueError("Invalid complete p-value family")
@@ -27,7 +28,12 @@ class EBH:
         if not 0 < self.alpha < 1:
             raise ValueError("Invalid e-BH level")
 
-    def select(self, log_e, ids, family_size):
+    def select(self, log_e: np.ndarray, ids: np.ndarray, family_size: int) -> np.ndarray:
+        """Return evidence-array positions passing e-BH, ranked by evidence then ID.
+
+        family_size includes the complete catalog; filtered features contribute
+        zero evidence. Feature IDs break ties, but are not returned positions.
+        """
         log_e, ids = np.asarray(log_e), np.asarray(ids)
         if (not np.isscalar(family_size) or not np.isfinite(family_size) or int(family_size) != family_size
                 or family_size < len(ids) or family_size < 0 or log_e.ndim != 1 or ids.shape != log_e.shape
